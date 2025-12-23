@@ -7,6 +7,7 @@
 #include "logging.h"
 #include "pmu.h"
 #include "wifi_server.h"
+#include "lora.h"
 
 // sample rate for print/log (ms)
 static const uint32_t SAMPLE_INTERVAL_MS = 200;
@@ -163,6 +164,11 @@ void setup() {
 
   // Wi-Fi AP + HTTP
   setupWiFi();
+
+  // LoRa TX
+  if (!initLoRa()) {
+    Serial.println("LoRa init failed; telemetry TX disabled");
+  }
 }
 
 void loop() {
@@ -201,6 +207,7 @@ void loop() {
     printTelemetry();
     appendGpsLog(epoch, lat, lon, alt_m, spd_kmh, hdop, sats);
     appendImuLog(epoch);
+    sendLoRaTelemetry(epoch, lat, lon, alt_m, spd_kmh, hdop, sats, imuData);
   }
 
   updateDisplay(now);
