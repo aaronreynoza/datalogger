@@ -1,8 +1,8 @@
 #include "led.h"
 
 #if defined(ARDUINO_ARCH_ESP32)
-#include <esp32-hal-neopixel.h>
 #include <soc/soc_caps.h>
+extern "C" void neopixelWrite(uint8_t pin, uint8_t r, uint8_t g, uint8_t b);
 #endif
 
 #if defined(LED_PIN)
