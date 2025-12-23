@@ -1,14 +1,19 @@
 #include "led.h"
 
-#ifdef LED_PIN
+#if defined(LED_PIN)
 static constexpr int LED_BUILTIN_PIN = LED_PIN;
-static constexpr bool LED_ACTIVE_LOW = false;
 #elif defined(LED_BUILTIN)
 static constexpr int LED_BUILTIN_PIN = LED_BUILTIN;
-static constexpr bool LED_ACTIVE_LOW = false;
 #else
 static constexpr int LED_BUILTIN_PIN = 21;
-static constexpr bool LED_ACTIVE_LOW = true;
+#endif
+
+#if defined(LED_ACTIVE_LOW)
+static constexpr bool LED_IS_ACTIVE_LOW = true;
+#elif defined(LED_ACTIVE_HIGH)
+static constexpr bool LED_IS_ACTIVE_LOW = false;
+#else
+static constexpr bool LED_IS_ACTIVE_LOW = false;
 #endif
 
 void initLed() {
@@ -21,7 +26,7 @@ void updateLed(uint32_t nowMs) {
   if (nowMs - lastLedToggleMs >= 500) {
     lastLedToggleMs = nowMs;
     ledOn = !ledOn;
-    if (LED_ACTIVE_LOW) {
+    if (LED_IS_ACTIVE_LOW) {
       digitalWrite(LED_BUILTIN_PIN, ledOn ? LOW : HIGH);
     } else {
       digitalWrite(LED_BUILTIN_PIN, ledOn ? HIGH : LOW);
