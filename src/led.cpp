@@ -21,7 +21,10 @@ static constexpr bool LED_IS_ACTIVE_LOW = false;
 static constexpr bool LED_IS_ACTIVE_LOW = false;
 #endif
 
-#if defined(PIN_NEOPIXEL)
+#if defined(LED_NEOPIXEL_GPIO)
+static constexpr bool LED_IS_NEOPIXEL = true;
+static constexpr int LED_NEOPIXEL_PIN = LED_NEOPIXEL_GPIO;
+#elif defined(PIN_NEOPIXEL)
 static constexpr bool LED_IS_NEOPIXEL = true;
 static constexpr int LED_NEOPIXEL_PIN = PIN_NEOPIXEL;
 #elif defined(SOC_GPIO_PIN_COUNT) && defined(LED_BUILTIN)
