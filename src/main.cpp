@@ -23,6 +23,12 @@ static const int IMU_MISO_PIN = 37;
 static const int IMU_SCK_PIN  = 36;
 static const int IMU_CS_PIN   = 34;
 
+#ifndef LED_BUILTIN
+static constexpr int LED_BUILTIN_PIN = 21;
+#else
+static constexpr int LED_BUILTIN_PIN = LED_BUILTIN;
+#endif
+
 SPIClass imuSPI(HSPI);
 SensorQMI8658 qmi;
 IMUdata imuAcc;
@@ -32,13 +38,15 @@ float    imuTempC     = NAN;
 uint32_t imuTimestamp = 0;
 
 // ================== Logging / FS ==================
-static const char *LOG_PREFIX = "/telemetry_";
-static const char *LOG_EXT    = ".csv";
+static const char *LOG_GPS_PREFIX = "/gps_";
+static const char *LOG_IMU_PREFIX = "/imu_";
+static const char *LOG_EXT        = ".csv";
 
 bool   storageReady   = false;
 bool   loggingEnabled = false;
 int    sessionId      = 1;
-String currentLogPath;
+String gpsLogPath;
+String imuLogPath;
 
 // sample rate for print/log (ms)
 static const uint32_t SAMPLE_INTERVAL_MS = 200;
@@ -99,41 +107,41 @@ bool initStorage() {
 
 String makeLogPath(int id) {
   char buf[32];
-  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_PREFIX, id, LOG_EXT);
+  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_GPS_PREFIX, id, LOG_EXT);
   return String(buf);
 }
 
-bool createNewLogFile(const String &path) {
+String makeImuLogPath(int id) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_IMU_PREFIX, id, LOG_EXT);
+  return String(buf);
+}
+
+bool createNewLogFile(const String &path, const char *header) {
   File f = LittleFS.open(path, "w");
   if (!f) return false;
 
-  // CSV header
-  f.println(
-    "epoch_s,ms_since_boot,"
-    "lat,lon,alt_m,spd_kmph,hdop,sats,"
-    "ax_mps2,ay_mps2,az_mps2,"
-    "gx_dps,gy_dps,gz_dps,imu_temp_C"
-  );
+  f.println(header);
   f.close();
   Serial.print("Created log file: ");
   Serial.println(path);
   return true;
 }
 
-void appendLog(uint32_t epoch,
-               double lat, double lon,
-               double alt_m, double spd_kmph,
-               double hdop, uint32_t sats) {
-  if (!storageReady || !loggingEnabled || currentLogPath.isEmpty()) return;
+void appendGpsLog(uint32_t epoch,
+                  double lat, double lon,
+                  double alt_m, double spd_kmph,
+                  double hdop, uint32_t sats) {
+  if (!storageReady || !loggingEnabled || gpsLogPath.isEmpty()) return;
 
-  File f = LittleFS.open(currentLogPath, "a");
+  File f = LittleFS.open(gpsLogPath, "a");
   if (!f) {
-    Serial.println("Failed to open log file for append");
+    Serial.println("Failed to open GPS log file for append");
     return;
   }
 
   String line;
-  line.reserve(200);
+  line.reserve(120);
 
   // epoch_s
   if (epoch) line += String(epoch);
@@ -157,29 +165,39 @@ void appendLog(uint32_t epoch,
   if (sats) line += String(sats);
   line += ",";
 
-  // IMU accel
+  f.println(line);
+  f.close();
+}
+
+void appendImuLog(uint32_t epoch) {
+  if (!storageReady || !loggingEnabled || imuLogPath.isEmpty()) return;
+
+  File f = LittleFS.open(imuLogPath, "a");
+  if (!f) {
+    Serial.println("Failed to open IMU log file for append");
+    return;
+  }
+
+  String line;
+  line.reserve(120);
+
+  if (epoch) line += String(epoch);
+  line += ",";
+  line += String(millis());
+  line += ",";
+
   if (imuHasData) {
-    line += String(imuAcc.x, 3);  line += ",";
-    line += String(imuAcc.y, 3);  line += ",";
-    line += String(imuAcc.z, 3);  line += ",";
+    line += String(imuAcc.x, 3); line += ",";
+    line += String(imuAcc.y, 3); line += ",";
+    line += String(imuAcc.z, 3); line += ",";
+    line += String(imuGyr.x, 3); line += ",";
+    line += String(imuGyr.y, 3); line += ",";
+    line += String(imuGyr.z, 3); line += ",";
   } else {
-    line += ",,,";
+    line += ",,,,,,";
   }
 
-  // IMU gyro
-  if (imuHasData) {
-    line += String(imuGyr.x, 3);  line += ",";
-    line += String(imuGyr.y, 3);  line += ",";
-    line += String(imuGyr.z, 3);  line += ",";
-  } else {
-    line += ",,,";
-  }
-
-  // IMU temperature
-  if (!isnan(imuTempC)) {
-    line += String(imuTempC, 2);
-  }
-
+  if (!isnan(imuTempC)) line += String(imuTempC, 2);
   f.println(line);
   f.close();
 }
@@ -204,14 +222,15 @@ void clearLogs() {
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if (name.startsWith(LOG_PREFIX)) {
+    if (name.startsWith(LOG_GPS_PREFIX) || name.startsWith(LOG_IMU_PREFIX)) {
       Serial.print("Removing "); Serial.println(name);
       LittleFS.remove(name);
     }
     file = root.openNextFile();
   }
   root.close();
-  currentLogPath = "";
+  gpsLogPath = "";
+  imuLogPath = "";
   loggingEnabled = false;
   sessionId = 1;
 }
@@ -226,7 +245,8 @@ void listLogsTo(Print &out) {
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if (name.startsWith(LOG_PREFIX) && name.endsWith(LOG_EXT)) {
+    if ((name.startsWith(LOG_GPS_PREFIX) || name.startsWith(LOG_IMU_PREFIX)) &&
+        name.endsWith(LOG_EXT)) {
       if (name.startsWith("/")) name.remove(0,1);
       out.println(name);
     }
@@ -255,7 +275,8 @@ void handleLogs() {
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if (name.startsWith(LOG_PREFIX) && name.endsWith(LOG_EXT)) {
+    if ((name.startsWith(LOG_GPS_PREFIX) || name.startsWith(LOG_IMU_PREFIX)) &&
+        name.endsWith(LOG_EXT)) {
       if (!first) json += ",";
       if (name.startsWith("/")) name.remove(0,1);
       json += "\"" + name + "\"";
@@ -311,8 +332,12 @@ void initImu() {
   pinMode(IMU_CS_PIN, OUTPUT);
   digitalWrite(IMU_CS_PIN, HIGH);
 
-  // NOTE: new SensorLib API wants SPIClass& + CS pin
-  if (!qmi.begin(imuSPI, IMU_CS_PIN)) {
+  // SensorLib v0.3.x SPI signature: begin(SPIClass&, csPin, mosi, miso, sck)
+  if (!qmi.begin(imuSPI,
+                 static_cast<uint8_t>(IMU_CS_PIN),
+                 IMU_MOSI_PIN,
+                 IMU_MISO_PIN,
+                 IMU_SCK_PIN)) {
     Serial.println("QMI8658 init FAILED");
     return;
   }
@@ -320,19 +345,13 @@ void initImu() {
   Serial.print("QMI8658 ID: 0x");
   Serial.println(qmi.getChipID(), HEX);
 
-  // New API: config* only take 3 args, "enable" is separate
   qmi.configAccelerometer(
-      SensorQMI8658::ACC_RANGE_4G,
-      SensorQMI8658::ACC_ODR_1000Hz,
-      SensorQMI8658::LPF_MODE_0);
+      SensorQMI8658::ACC_RANGE_8G,
+      SensorQMI8658::ACC_ODR_1000Hz);
 
   qmi.configGyroscope(
-      SensorQMI8658::GYR_RANGE_64DPS,
-      SensorQMI8658::GYR_ODR_896_8Hz,
-      SensorQMI8658::LPF_MODE_3);
-
-  qmi.enableAccelerometer();
-  qmi.enableGyroscope();
+      SensorQMI8658::GYR_RANGE_512DPS,
+      SensorQMI8658::GYR_ODR_896_8Hz);
 
   Serial.println("QMI8658 configured");
 }
@@ -368,23 +387,39 @@ void handleSerialCommands() {
         break;
       }
       if (!loggingEnabled) {
-        currentLogPath = makeLogPath(sessionId++);
-        if (!createNewLogFile(currentLogPath)) {
-          currentLogPath = "";
+        int newId = sessionId++;
+        gpsLogPath = makeLogPath(newId);
+        imuLogPath = makeImuLogPath(newId);
+
+        static const char *gpsHeader =
+          "epoch_s,ms_since_boot,lat,lon,alt_m,spd_kmph,hdop,sats";
+        static const char *imuHeader =
+          "epoch_s,ms_since_boot,ax_mps2,ay_mps2,az_mps2,"
+          "gx_dps,gy_dps,gz_dps,imu_temp_C";
+
+        if (!createNewLogFile(gpsLogPath, gpsHeader) ||
+            !createNewLogFile(imuLogPath, imuHeader)) {
+          gpsLogPath = "";
+          imuLogPath = "";
           loggingEnabled = false;
           break;
         }
         loggingEnabled = true;
         Serial.print("Logging ENABLED to ");
-        Serial.println(currentLogPath);
+        Serial.print(gpsLogPath);
+        Serial.print(" and ");
+        Serial.println(imuLogPath);
       } else {
         loggingEnabled = false;
         Serial.print("Logging DISABLED. Last file: ");
-        Serial.println(currentLogPath);
+        Serial.print(gpsLogPath);
+        Serial.print(" / ");
+        Serial.println(imuLogPath);
       }
       break;
     case 'd':
-      if (!currentLogPath.isEmpty()) dumpFile(currentLogPath);
+      if (!gpsLogPath.isEmpty()) dumpFile(gpsLogPath);
+      if (!imuLogPath.isEmpty()) dumpFile(imuLogPath);
       else Serial.println("No current log file.");
       break;
     case 'c':
@@ -484,6 +519,8 @@ void setup() {
   Serial.println("==== T-Beam Supreme GPS + IMU + WiFi logger ====");
   Serial.println("Commands: D=toggle logging, d=dump current file, c=clear, l=list files");
 
+  pinMode(LED_BUILTIN_PIN, OUTPUT);
+
   // Storage
   storageReady = initStorage();
   if (!storageReady) {
@@ -537,6 +574,15 @@ void loop() {
     uint32_t epoch = gpsUnixTime();
 
     printTelemetry();
-    appendLog(epoch, lat, lon, alt_m, spd_kmh, hdop, sats);
+    appendGpsLog(epoch, lat, lon, alt_m, spd_kmh, hdop, sats);
+    appendImuLog(epoch);
+  }
+
+  static uint32_t lastLedToggleMs = 0;
+  static bool ledOn = false;
+  if (now - lastLedToggleMs >= 500) {
+    lastLedToggleMs = now;
+    ledOn = !ledOn;
+    digitalWrite(LED_BUILTIN_PIN, ledOn ? HIGH : LOW);
   }
 }
