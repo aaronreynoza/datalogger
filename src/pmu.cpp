@@ -20,7 +20,11 @@ void initPmu() {
 
   Serial.println("[PMU] AXP2101 connected");
 
+#if defined(XPOWERS_CHG_LED_CTRL_ON)
   pmu.setChargingLedMode(XPOWERS_CHG_LED_CTRL_ON);
+#else
+  pmu.setChargingLedMode(XPOWERS_CHG_LED_CTRL_CHG);
+#endif
 
   pmu.setALDO1Voltage(3300);
   pmu.enableALDO1(); // OLED/sensors
