@@ -39,7 +39,44 @@ static constexpr uint8_t LED_NEOPIXEL_ON_R = 0;
 static constexpr uint8_t LED_NEOPIXEL_ON_G = 0;
 static constexpr uint8_t LED_NEOPIXEL_ON_B = 32;
 
+#if defined(LED_SWEEP_ENABLE)
+struct LedTarget {
+  int pin;
+  bool isNeopixel;
+};
+
+static constexpr LedTarget LED_SWEEP_TARGETS[] = {
+    {LED_NEOPIXEL_PIN, true},
+    {38, true},
+    {21, false},
+    {14, false},
+    {2, false},
+    {4, false},
+    {0, false},
+    {45, false},
+    {46, false},
+    {47, false},
+    {48, false},
+};
+
+static constexpr uint32_t LED_SWEEP_STEP_MS = 2000;
+#endif
+
 void initLed() {
+#if defined(LED_SWEEP_ENABLE)
+  for (const auto &target : LED_SWEEP_TARGETS) {
+    if (target.pin < 0) {
+      continue;
+    }
+    if (target.isNeopixel) {
+      neopixelWrite(target.pin, 0, 0, 0);
+    } else {
+      pinMode(target.pin, OUTPUT);
+      digitalWrite(target.pin, LED_IS_ACTIVE_LOW ? HIGH : LOW);
+    }
+  }
+  return;
+#endif
   if (LED_IS_NEOPIXEL) {
     neopixelWrite(LED_NEOPIXEL_PIN, 0, 0, 0);
     return;
@@ -49,10 +86,40 @@ void initLed() {
 
 void updateLed(uint32_t nowMs) {
   static uint32_t lastLedToggleMs = 0;
+  static uint32_t lastSweepMs = 0;
   static bool ledOn = false;
+  static size_t sweepIndex = 0;
+#if defined(LED_SWEEP_ENABLE)
+  if (nowMs - lastSweepMs >= LED_SWEEP_STEP_MS) {
+    lastSweepMs = nowMs;
+    sweepIndex = (sweepIndex + 1) % (sizeof(LED_SWEEP_TARGETS) / sizeof(LED_SWEEP_TARGETS[0]));
+    ledOn = false;
+  }
+  const auto &target = LED_SWEEP_TARGETS[sweepIndex];
+#endif
   if (nowMs - lastLedToggleMs >= 500) {
     lastLedToggleMs = nowMs;
     ledOn = !ledOn;
+#if defined(LED_SWEEP_ENABLE)
+    if (target.pin >= 0) {
+      if (target.isNeopixel) {
+        if (ledOn) {
+          neopixelWrite(
+              target.pin,
+              LED_NEOPIXEL_ON_R,
+              LED_NEOPIXEL_ON_G,
+              LED_NEOPIXEL_ON_B);
+        } else {
+          neopixelWrite(target.pin, 0, 0, 0);
+        }
+      } else if (LED_IS_ACTIVE_LOW) {
+        digitalWrite(target.pin, ledOn ? LOW : HIGH);
+      } else {
+        digitalWrite(target.pin, ledOn ? HIGH : LOW);
+      }
+    }
+    return;
+#endif
     if (LED_IS_NEOPIXEL) {
       if (ledOn) {
         neopixelWrite(
