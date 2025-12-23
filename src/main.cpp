@@ -332,12 +332,8 @@ void initImu() {
   pinMode(IMU_CS_PIN, OUTPUT);
   digitalWrite(IMU_CS_PIN, HIGH);
 
-  // SensorLib v0.3.x SPI signature: begin(SPIClass&, csPin, mosi, miso, sck)
-  if (!qmi.begin(imuSPI,
-                 static_cast<uint8_t>(IMU_CS_PIN),
-                 IMU_MOSI_PIN,
-                 IMU_MISO_PIN,
-                 IMU_SCK_PIN)) {
+  // NOTE: SensorLib API used in this project expects SPIClass& + CS pin
+  if (!qmi.begin(imuSPI, IMU_CS_PIN)) {
     Serial.println("QMI8658 init FAILED");
     return;
   }
@@ -346,12 +342,17 @@ void initImu() {
   Serial.println(qmi.getChipID(), HEX);
 
   qmi.configAccelerometer(
-      SensorQMI8658::ACC_RANGE_8G,
-      SensorQMI8658::ACC_ODR_1000Hz);
+      SensorQMI8658::ACC_RANGE_4G,
+      SensorQMI8658::ACC_ODR_1000Hz,
+      SensorQMI8658::LPF_MODE_0);
 
   qmi.configGyroscope(
-      SensorQMI8658::GYR_RANGE_512DPS,
-      SensorQMI8658::GYR_ODR_896_8Hz);
+      SensorQMI8658::GYR_RANGE_64DPS,
+      SensorQMI8658::GYR_ODR_896_8Hz,
+      SensorQMI8658::LPF_MODE_3);
+
+  qmi.enableAccelerometer();
+  qmi.enableGyroscope();
 
   Serial.println("QMI8658 configured");
 }
