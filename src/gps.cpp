@@ -6,14 +6,28 @@ static const int GNSS_TX_PIN = 8;   // ESP32S3 transmits on this
 TinyGPSPlus gps;
 HardwareSerial GNSS(1);
 
+static uint32_t lastGpsDataMs = 0;
+
 void initGps() {
   GNSS.begin(9600, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
   Serial.println("GNSS serial started, waiting for fix...");
+  lastGpsDataMs = millis();
 }
 
 void pollGps() {
+  bool gotData = false;
   while (GNSS.available() > 0) {
     gps.encode(GNSS.read());
+    gotData = true;
+  }
+  if (gotData) {
+    lastGpsDataMs = millis();
+  } else if (millis() - lastGpsDataMs > 5000) {
+    Serial.println("GNSS idle, restarting serial...");
+    GNSS.end();
+    delay(20);
+    GNSS.begin(9600, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+    lastGpsDataMs = millis();
   }
 }
 

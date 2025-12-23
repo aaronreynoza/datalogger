@@ -146,6 +146,7 @@ void setup() {
   Serial.println("Commands: D=toggle logging, d=dump current file, c=clear, l=list files");
 
   initPmu();
+  delay(200);
   initLed();
 
   // Storage
