@@ -4,6 +4,7 @@
 #include "gps.h"
 #include "imu.h"
 #include "led.h"
+#include "display.h"
 #include "logging.h"
 #include "pmu.h"
 #include "wifi_server.h"
@@ -148,6 +149,7 @@ void setup() {
   initPmu();
   delay(200);
   initLed();
+  initDisplay();
 
   // Storage
   storageReady = initStorage();
@@ -204,4 +206,5 @@ void loop() {
   }
 
   updateLed(now);
+  updateDisplay(now);
 }
