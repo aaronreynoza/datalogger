@@ -3,7 +3,6 @@
 
 #include "gps.h"
 #include "imu.h"
-#include "led.h"
 #include "display.h"
 #include "logging.h"
 #include "pmu.h"
@@ -148,7 +147,6 @@ void setup() {
 
   initPmu();
   delay(200);
-  initLed();
   initDisplay();
 
   // Storage
@@ -205,6 +203,5 @@ void loop() {
     appendImuLog(epoch);
   }
 
-  updateLed(now);
   updateDisplay(now);
 }
