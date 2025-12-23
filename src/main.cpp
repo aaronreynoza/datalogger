@@ -5,6 +5,7 @@
 #include "imu.h"
 #include "led.h"
 #include "logging.h"
+#include "pmu.h"
 #include "wifi_server.h"
 
 // sample rate for print/log (ms)
@@ -144,6 +145,7 @@ void setup() {
   Serial.println("==== T-Beam Supreme GPS + IMU + WiFi logger ====");
   Serial.println("Commands: D=toggle logging, d=dump current file, c=clear, l=list files");
 
+  initPmu();
   initLed();
 
   // Storage

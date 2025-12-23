@@ -1,6 +1,9 @@
 #include "led.h"
 
-#ifdef LED_BUILTIN
+#ifdef LED_PIN
+static constexpr int LED_BUILTIN_PIN = LED_PIN;
+static constexpr bool LED_ACTIVE_LOW = false;
+#elif defined(LED_BUILTIN)
 static constexpr int LED_BUILTIN_PIN = LED_BUILTIN;
 static constexpr bool LED_ACTIVE_LOW = false;
 #else
