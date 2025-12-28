@@ -7,6 +7,7 @@
 #include "logging.h"
 #include "pmu.h"
 #include "wifi_server.h"
+#include "lora.h"
 
 // sample rate for print/log (ms)
 static const uint32_t SAMPLE_INTERVAL_MS = 200;
@@ -31,22 +32,37 @@ void handleSerialCommands() {
           break;
         }
         loggingEnabled = true;
+#if defined(LOG_STATUS_ONLY)
+        Serial.print("Status logging ENABLED to ");
+        Serial.println(statusLogPath);
+#else
         Serial.print("Logging ENABLED to ");
         Serial.print(gpsLogPath);
         Serial.print(" and ");
         Serial.println(imuLogPath);
+#endif
       } else {
         stopLogging();
+#if defined(LOG_STATUS_ONLY)
+        Serial.print("Status logging DISABLED. Last file: ");
+        Serial.println(statusLogPath);
+#else
         Serial.print("Logging DISABLED. Last file: ");
         Serial.print(gpsLogPath);
         Serial.print(" / ");
         Serial.println(imuLogPath);
+#endif
       }
       break;
     case 'd':
+#if defined(LOG_STATUS_ONLY)
+      if (!statusLogPath.isEmpty()) dumpFile(statusLogPath);
+      else Serial.println("No current log file.");
+#else
       if (!gpsLogPath.isEmpty()) dumpFile(gpsLogPath);
       if (!imuLogPath.isEmpty()) dumpFile(imuLogPath);
       else Serial.println("No current log file.");
+#endif
       break;
     case 'c':
     case 'C':
@@ -66,6 +82,25 @@ void handleSerialCommands() {
 // ================== Printing to serial ==================
 void printTelemetry() {
   uint32_t epoch = gpsUnixTime();
+
+#if defined(LOG_STATUS_ONLY)
+  bool gpsOk = gps.location.isValid() || gps.satellites.isValid();
+  bool imuOk = imuData.hasData;
+  bool loraOk = isLoRaReady();
+  bool storageOk = storageReady;
+
+  Serial.print("Status | GPS=");
+  Serial.print(gpsOk ? "OK" : "NO");
+  Serial.print(" | IMU=");
+  Serial.print(imuOk ? "OK" : "NO");
+  Serial.print(" | LoRa=");
+  Serial.print(loraOk ? "OK" : "NO");
+  Serial.print(" | Storage=");
+  Serial.print(storageOk ? "OK" : "NO");
+  Serial.print(" | logging=");
+  Serial.println(loggingEnabled ? "ON" : "OFF");
+  return;
+#endif
 
   Serial.print("t=");
   if (epoch) Serial.print(epoch);
@@ -132,6 +167,37 @@ void printTelemetry() {
     Serial.print("N/A");
   }
 
+  Serial.print(" | PMU VBAT: ");
+  uint16_t vbatMv = pmuBattVoltageMv();
+  if (vbatMv) {
+    Serial.print(vbatMv);
+    Serial.print(" mV");
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" | VBUS: ");
+  uint16_t vbusMv = pmuVbusVoltageMv();
+  if (vbusMv) {
+    Serial.print(vbusMv);
+    Serial.print(" mV");
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" | VSYS: ");
+  uint16_t vsysMv = pmuSystemVoltageMv();
+  if (vsysMv) {
+    Serial.print(vsysMv);
+    Serial.print(" mV");
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" | BATT%: ");
+  int battPct = pmuBatteryPercent();
+  if (battPct >= 0) Serial.print(battPct);
+  else Serial.print("N/A");
+  Serial.print(" | CHG: ");
+  Serial.print(pmuIsCharging() ? "Y" : "N");
+
   Serial.print(" | logging=");
   Serial.println(loggingEnabled ? "ON" : "OFF");
 }
@@ -163,6 +229,11 @@ void setup() {
 
   // Wi-Fi AP + HTTP
   setupWiFi();
+
+  // LoRa TX
+  if (!initLoRa()) {
+    Serial.println("LoRa init failed; telemetry TX disabled");
+  }
 }
 
 void loop() {
@@ -199,8 +270,17 @@ void loop() {
     uint32_t epoch = gpsUnixTime();
 
     printTelemetry();
+#if defined(LOG_STATUS_ONLY)
+    bool gpsOk = locValid || satsValid;
+    bool imuOk = imuData.hasData;
+    bool loraOk = isLoRaReady();
+    bool storageOk = storageReady;
+    appendStatusLog(gpsOk, imuOk, loraOk, storageOk);
+#else
     appendGpsLog(epoch, lat, lon, alt_m, spd_kmh, hdop, sats);
     appendImuLog(epoch);
+#endif
+    sendLoRaTelemetry(epoch, lat, lon, alt_m, spd_kmh, hdop, sats, imuData);
   }
 
   updateDisplay(now);
