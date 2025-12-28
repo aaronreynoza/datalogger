@@ -9,16 +9,19 @@ static constexpr uint8_t PMU_ADDR = 0x34;
 
 static TwoWire pmuWire(1);
 static XPowersAXP2101 pmu;
+static bool pmuReady = false;
 
 void initPmu() {
   Serial.println("[PMU] Initializing AXP2101");
 
   if (!pmu.begin(pmuWire, PMU_ADDR, PMU_SDA, PMU_SCL)) {
     Serial.println("[PMU] AXP2101 not found");
+    pmuReady = false;
     return;
   }
 
   Serial.println("[PMU] AXP2101 connected");
+  pmuReady = true;
 
 #if defined(XPOWERS_CHG_LED_CTRL_ON)
   pmu.setChargingLedMode(XPOWERS_CHG_LED_CTRL_ON);
@@ -41,4 +44,43 @@ void initPmu() {
   pmu.enableBattVoltageMeasure();
   pmu.enableVbusVoltageMeasure();
   pmu.enableSystemVoltageMeasure();
+}
+
+bool isPmuReady() {
+  return pmuReady;
+}
+
+uint16_t pmuBattVoltageMv() {
+  if (!pmuReady) return 0;
+  return pmu.getBattVoltage();
+}
+
+uint16_t pmuVbusVoltageMv() {
+  if (!pmuReady) return 0;
+  return pmu.getVbusVoltage();
+}
+
+uint16_t pmuSystemVoltageMv() {
+  if (!pmuReady) return 0;
+  return pmu.getSystemVoltage();
+}
+
+int pmuBatteryPercent() {
+  if (!pmuReady) return -1;
+  return pmu.getBatteryPercent();
+}
+
+bool pmuBatteryConnected() {
+  if (!pmuReady) return false;
+  return pmu.isBatteryConnect();
+}
+
+bool pmuVbusPresent() {
+  if (!pmuReady) return false;
+  return pmu.isVbusIn();
+}
+
+bool pmuIsCharging() {
+  if (!pmuReady) return false;
+  return pmu.isCharging();
 }

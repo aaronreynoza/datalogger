@@ -3,15 +3,15 @@
 #include <RadioLib.h>
 #include <SPI.h>
 
-// SX1262 pins for T-Beam S3 Supreme.
-// NOTE: Double-check these pins with your board silkscreen/datasheet.
-static const int LORA_SCK_PIN  = 5;
-static const int LORA_MISO_PIN = 6;
-static const int LORA_MOSI_PIN = 4;
-static const int LORA_CS_PIN   = 7;  // NSS
-static const int LORA_RST_PIN  = 8;
-static const int LORA_BUSY_PIN = 9;
-static const int LORA_DIO1_PIN = 3;
+#include "pmu.h"
+// SX1262 pins for T-Beam S3 Supreme (per LilyGo pinout).
+static const int LORA_SCK_PIN  = 12;
+static const int LORA_MISO_PIN = 13;
+static const int LORA_MOSI_PIN = 11;
+static const int LORA_CS_PIN   = 10;  // NSS
+static const int LORA_RST_PIN  = 5;
+static const int LORA_BUSY_PIN = 4;
+static const int LORA_DIO1_PIN = 1;
 
 static const float    LORA_FREQ_MHZ         = 915.0f;  // set to 868.0 for EU, etc.
 static const uint16_t LORA_BW_KHZ           = 125;
@@ -19,6 +19,7 @@ static const uint8_t  LORA_SF               = 9;
 static const uint8_t  LORA_CR               = 5;       // 4/5
 static const int8_t   LORA_TX_POWER_DBM     = 17;
 static const uint32_t LORA_SEND_INTERVAL_MS = 1000;    // throttle RF duty cycle
+static const char    *LORA_DEVICE_ID        = "tbeam01";
 
 static SPIClass loraSPI(FSPI);
 static Module   loraModule(LORA_CS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN, loraSPI);
@@ -53,6 +54,10 @@ bool initLoRa() {
   return true;
 }
 
+bool isLoRaReady() {
+  return loraReady;
+}
+
 void sendLoRaTelemetry(uint32_t epoch,
                        double lat, double lon,
                        double alt_m, double spd_kmph,
@@ -64,7 +69,10 @@ void sendLoRaTelemetry(uint32_t epoch,
   if (now - lastLoRaSendMs < LORA_SEND_INTERVAL_MS) return;
 
   String payload;
-  payload.reserve(180);
+  payload.reserve(240);
+
+  payload += LORA_DEVICE_ID;
+  payload += ",";
 
   if (epoch) payload += String(epoch);
   payload += ",";
@@ -96,6 +104,26 @@ void sendLoRaTelemetry(uint32_t epoch,
   }
 
   if (!isnan(imu.tempC)) payload += String(imu.tempC, 2);
+
+  // PMU telemetry (mV, %, presence)
+  payload += ",";
+  uint16_t vbatMv = pmuBattVoltageMv();
+  if (vbatMv) payload += String(vbatMv);
+  payload += ",";
+  uint16_t vbusMv = pmuVbusVoltageMv();
+  if (vbusMv) payload += String(vbusMv);
+  payload += ",";
+  uint16_t vsysMv = pmuSystemVoltageMv();
+  if (vsysMv) payload += String(vsysMv);
+  payload += ",";
+  int battPct = pmuBatteryPercent();
+  if (battPct >= 0) payload += String(battPct);
+  payload += ",";
+  payload += (pmuBatteryConnected() ? "1" : "0");
+  payload += ",";
+  payload += (pmuVbusPresent() ? "1" : "0");
+  payload += ",";
+  payload += (pmuIsCharging() ? "1" : "0");
 
   int state = lora.transmit(payload);
   if (state != RADIOLIB_ERR_NONE) {

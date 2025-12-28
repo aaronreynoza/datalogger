@@ -8,6 +8,7 @@ extern bool storageReady;
 extern bool loggingEnabled;
 extern String gpsLogPath;
 extern String imuLogPath;
+extern String statusLogPath;
 
 bool initStorage();
 bool createSessionLogs();
@@ -17,6 +18,7 @@ void appendGpsLog(uint32_t epoch,
                   double alt_m, double spd_kmph,
                   double hdop, uint32_t sats);
 void appendImuLog(uint32_t epoch);
+void appendStatusLog(bool gpsOk, bool imuOk, bool loraOk, bool storageOk);
 void dumpFile(const String &path);
 void clearLogs();
 void listLogsTo(Print &out);

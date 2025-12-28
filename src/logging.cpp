@@ -4,12 +4,14 @@
 
 static const char *LOG_GPS_PREFIX = "/gps_";
 static const char *LOG_IMU_PREFIX = "/imu_";
+static const char *LOG_STATUS_PREFIX = "/status_";
 static const char *LOG_EXT        = ".csv";
 
 bool storageReady = false;
 bool loggingEnabled = false;
 String gpsLogPath;
 String imuLogPath;
+String statusLogPath;
 
 static int sessionId = 1;
 
@@ -22,6 +24,12 @@ static String makeLogPath(int id) {
 static String makeImuLogPath(int id) {
   char buf[32];
   snprintf(buf, sizeof(buf), "%s%03d%s", LOG_IMU_PREFIX, id, LOG_EXT);
+  return String(buf);
+}
+
+static String makeStatusLogPath(int id) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_STATUS_PREFIX, id, LOG_EXT);
   return String(buf);
 }
 
@@ -49,20 +57,34 @@ bool createSessionLogs() {
   int newId = sessionId++;
   gpsLogPath = makeLogPath(newId);
   imuLogPath = makeImuLogPath(newId);
+  statusLogPath = makeStatusLogPath(newId);
 
   static const char *gpsHeader =
     "epoch_s,ms_since_boot,lat,lon,alt_m,spd_kmph,hdop,sats";
   static const char *imuHeader =
     "epoch_s,ms_since_boot,ax_mps2,ay_mps2,az_mps2,"
     "gx_dps,gy_dps,gz_dps,imu_temp_C";
+  static const char *statusHeader =
+    "ms_since_boot,gps_ok,imu_ok,lora_ok,storage_ok";
 
+#if defined(LOG_STATUS_ONLY)
+  if (!createNewLogFile(statusLogPath, statusHeader)) {
+    statusLogPath = "";
+    return false;
+  }
+  gpsLogPath = "";
+  imuLogPath = "";
+  return true;
+#else
   if (!createNewLogFile(gpsLogPath, gpsHeader) ||
       !createNewLogFile(imuLogPath, imuHeader)) {
     gpsLogPath = "";
     imuLogPath = "";
     return false;
   }
+  statusLogPath = "";
   return true;
+#endif
 }
 
 void stopLogging() {
@@ -73,6 +95,16 @@ void appendGpsLog(uint32_t epoch,
                   double lat, double lon,
                   double alt_m, double spd_kmph,
                   double hdop, uint32_t sats) {
+#if defined(LOG_STATUS_ONLY)
+  (void)epoch;
+  (void)lat;
+  (void)lon;
+  (void)alt_m;
+  (void)spd_kmph;
+  (void)hdop;
+  (void)sats;
+  return;
+#endif
   if (!storageReady || !loggingEnabled || gpsLogPath.isEmpty()) return;
 
   File f = LittleFS.open(gpsLogPath, "a");
@@ -108,6 +140,10 @@ void appendGpsLog(uint32_t epoch,
 }
 
 void appendImuLog(uint32_t epoch) {
+#if defined(LOG_STATUS_ONLY)
+  (void)epoch;
+  return;
+#endif
   if (!storageReady || !loggingEnabled || imuLogPath.isEmpty()) return;
 
   File f = LittleFS.open(imuLogPath, "a");
@@ -140,6 +176,37 @@ void appendImuLog(uint32_t epoch) {
   f.close();
 }
 
+void appendStatusLog(bool gpsOk, bool imuOk, bool loraOk, bool storageOk) {
+#if !defined(LOG_STATUS_ONLY)
+  (void)gpsOk;
+  (void)imuOk;
+  (void)loraOk;
+  (void)storageOk;
+  return;
+#endif
+  if (!storageReady || !loggingEnabled || statusLogPath.isEmpty()) return;
+
+  File f = LittleFS.open(statusLogPath, "a");
+  if (!f) {
+    Serial.println("Failed to open status log file for append");
+    return;
+  }
+
+  String line;
+  line.reserve(64);
+  line += String(millis());
+  line += ",";
+  line += (gpsOk ? "1" : "0");
+  line += ",";
+  line += (imuOk ? "1" : "0");
+  line += ",";
+  line += (loraOk ? "1" : "0");
+  line += ",";
+  line += (storageOk ? "1" : "0");
+  f.println(line);
+  f.close();
+}
+
 void dumpFile(const String &path) {
   File f = LittleFS.open(path, "r");
   if (!f) {
@@ -160,7 +227,9 @@ void clearLogs() {
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if (name.startsWith(LOG_GPS_PREFIX) || name.startsWith(LOG_IMU_PREFIX)) {
+    if (name.startsWith(LOG_GPS_PREFIX) ||
+        name.startsWith(LOG_IMU_PREFIX) ||
+        name.startsWith(LOG_STATUS_PREFIX)) {
       Serial.print("Removing "); Serial.println(name);
       LittleFS.remove(name);
     }
@@ -169,6 +238,7 @@ void clearLogs() {
   root.close();
   gpsLogPath = "";
   imuLogPath = "";
+  statusLogPath = "";
   loggingEnabled = false;
   sessionId = 1;
 }
@@ -182,7 +252,9 @@ void listLogsTo(Print &out) {
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if ((name.startsWith(LOG_GPS_PREFIX) || name.startsWith(LOG_IMU_PREFIX)) &&
+    if ((name.startsWith(LOG_GPS_PREFIX) ||
+         name.startsWith(LOG_IMU_PREFIX) ||
+         name.startsWith(LOG_STATUS_PREFIX)) &&
         name.endsWith(LOG_EXT)) {
       if (name.startsWith("/")) name.remove(0,1);
       out.println(name);

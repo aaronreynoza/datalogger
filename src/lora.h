@@ -5,6 +5,7 @@
 #include "imu.h"
 
 bool initLoRa();
+bool isLoRaReady();
 void sendLoRaTelemetry(uint32_t epoch,
                        double lat, double lon,
                        double alt_m, double spd_kmph,
