@@ -159,17 +159,22 @@ static constexpr uint8_t UNIT_DEG_C     = 3;
 static constexpr uint8_t UNIT_DEG       = 4;
 static constexpr uint8_t UNIT_M_PER_S   = 5;
 static constexpr uint8_t UNIT_METERS    = 10;
+static constexpr uint8_t UNIT_RPM       = 11;
+static constexpr uint8_t UNIT_PERCENT   = 12;
 static constexpr uint8_t UNIT_MS        = 13;
 
 // Data type enum
 static constexpr uint8_t DT_FLOAT32 = 1;
 static constexpr uint8_t DT_FLOAT64 = 2;
 static constexpr uint8_t DT_INT16   = 5;
-static constexpr uint8_t DT_UINT16  = 6;
+static constexpr uint8_t DT_INT8    = 3;
 static constexpr uint8_t DT_UINT8   = 4;
+static constexpr uint8_t DT_UINT16  = 6;
 
 // Channel flags
-static constexpr uint8_t CF_IS_GPS = 1 << 1;
+static constexpr uint8_t CF_IS_GPS     = 1 << 1;
+static constexpr uint8_t CF_IS_CAN     = 1 << 2;
+static constexpr uint8_t CF_PER_CORNER = 1 << 3;
 
 static const ChannelDef CHANNELS[] = {
   {1,  "dynamics.gforce.lon",   UNIT_G,         DT_INT16,   100, 0},
@@ -191,6 +196,18 @@ static const ChannelDef CHANNELS[] = {
   {17, "dynamics.vel.east",     UNIT_M_PER_S,   DT_FLOAT32, 10,  CF_IS_GPS},
   {18, "position.lap.dist",     UNIT_METERS,    DT_FLOAT32, 10,  CF_IS_GPS},
   {19, "dynamics.speed",         UNIT_M_PER_S,   DT_FLOAT32, 10,  CF_IS_GPS},
+
+  // ──── CAN Bus channels (reserved, no data until hardware connected) ────
+  // These channel IDs are reserved. The ATP writer won't produce data for
+  // them until CAN bus hardware is integrated. The desktop reader will
+  // auto-discover them when they appear in the channel table.
+  // {32, "engine.rpm",           UNIT_RPM,       DT_FLOAT32, 50,  CF_IS_CAN},
+  // {33, "input.throttle",      UNIT_PERCENT,   DT_FLOAT32, 50,  CF_IS_CAN},
+  // {34, "input.brake",         UNIT_PERCENT,   DT_FLOAT32, 50,  CF_IS_CAN},
+  // {35, "input.steering",      UNIT_DEG,       DT_FLOAT32, 50,  CF_IS_CAN},
+  // {36, "engine.gear",         UNIT_NONE,      DT_INT8,    10,  CF_IS_CAN},
+  // {37, "engine.coolant.temp", UNIT_DEG_C,     DT_FLOAT32, 1,   CF_IS_CAN},
+  // {38, "wheel.speed",         UNIT_M_PER_S,   DT_FLOAT32, 50,  CF_IS_CAN | CF_PER_CORNER},
 };
 
 static constexpr uint16_t NUM_CHANNELS = sizeof(CHANNELS) / sizeof(CHANNELS[0]);
