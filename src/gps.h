@@ -9,3 +9,4 @@ extern HardwareSerial GNSS;
 void initGps();
 void pollGps();
 uint32_t gpsUnixTime();
+void configureGps10Hz();
