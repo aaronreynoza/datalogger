@@ -139,6 +139,7 @@ struct AtpFileMeta {
   char     vehicleName[64];
   char     trackName[32];
   uint64_t startTimeMs;
+  uint32_t fileSize;   // total file size in bytes
 };
 bool atpReadMeta(const char *path, AtpFileMeta &meta);
 

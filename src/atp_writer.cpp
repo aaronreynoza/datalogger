@@ -337,10 +337,10 @@ static void writeChunkToFile(AtpSession &s) {
   if (s.hasGps) {
     chunkSize += 5 + GPS_RECORD_SIZE;
   }
-  // Lap events
-  chunkSize += s.lapEventCount * (5u + LAP_EVENT_SIZE);
-  // State changes
-  chunkSize += s.stateChangeCount * (5u + STATE_CHANGE_SIZE);
+  // Lap events (3-byte header: type + size; time_offset is embedded in buffer)
+  chunkSize += s.lapEventCount * (3u + LAP_EVENT_SIZE);
+  // State changes (same: 3-byte header)
+  chunkSize += s.stateChangeCount * (3u + STATE_CHANGE_SIZE);
 
   // Write chunk header
   s.file.write(CHK_MAGIC, 4);
@@ -373,18 +373,17 @@ static void writeChunkToFile(AtpSession &s) {
     s.file.write(s.gpsBuf, GPS_RECORD_SIZE);
   }
 
-  // Write lap events
+  // Write lap events (time_offset_ms is embedded in buffer's first 2 bytes)
   for (uint8_t i = 0; i < s.lapEventCount; ++i) {
-    uint16_t recSize = 5 + LAP_EVENT_SIZE;
+    uint16_t recSize = 3 + LAP_EVENT_SIZE;  // 3-byte header (type+size) + buffer
     writeU8(s.file, REC_LAP_EVENT);
     writeU16(s.file, recSize);
-    // time_offset_ms is embedded in the lap event buffer's first 2 bytes
     s.file.write(s.lapBuf[i], LAP_EVENT_SIZE);
   }
 
-  // Write state changes
+  // Write state changes (time_offset_ms is embedded in buffer's first 2 bytes)
   for (uint8_t i = 0; i < s.stateChangeCount; ++i) {
-    uint16_t recSize = 5 + STATE_CHANGE_SIZE;
+    uint16_t recSize = 3 + STATE_CHANGE_SIZE;  // 3-byte header (type+size) + buffer
     writeU8(s.file, REC_STATE_CHANGE);
     writeU16(s.file, recSize);
     s.file.write(s.stateBuf[i], STATE_CHANGE_SIZE);
@@ -435,7 +434,8 @@ static void writeLapIndex(AtpSession &s) {
     writeU32(s.file, lap.endChunk);
     writeU32(s.file, lap.timeMs);
     writeU16(s.file, lap.flags);
-    writeF32(s.file, lap.distanceM);
+    // Note: lap.distanceM is NOT written — spec defines 16 bytes/entry (no distance field).
+    // Distance is available in lap event records within chunks.
   }
 }
 
@@ -783,6 +783,7 @@ bool atpReadMeta(const char *path, AtpFileMeta &meta) {
   memset(&meta, 0, sizeof(meta));
   File f = SD.open(path, "r");
   if (!f) return false;
+  meta.fileSize = f.size();
 
   // Read and verify magic
   uint8_t magic[4];

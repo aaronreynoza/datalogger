@@ -58,6 +58,8 @@ static void drawStatusBar(int y) {
 
 void initDisplay() {
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);           // 400 kHz — cuts sendBuffer() from ~100ms to ~25ms
+  u8g2.setBusClock(400000);
   u8g2.begin();
   u8g2.setI2CAddress(0x3C << 1);
   u8g2.clearBuffer();
@@ -109,10 +111,16 @@ void displayBootDone() {
 void updateDisplay(uint32_t nowMs) {
   static uint32_t lastUiMs = 0;
   TrackUiState ts = getTrackUiState();
-  // Faster refresh when recording (for blink) or racing (for timer)
-  uint32_t interval = (ts.trackState == TRACK_STATE_RECORDING ||
-                       ts.startPending ||
-                       ts.trackState == TRACK_STATE_RACING) ? 200 : 500;
+  // State-dependent refresh: faster for video-friendly states.
+  // At 400 kHz I2C, sendBuffer() ≈ 25ms per frame.
+  uint32_t interval;
+  if (ts.trackState == TRACK_STATE_RACING) {
+    interval = 100;   // 10 Hz — smooth lap timer on camera
+  } else if (ts.trackState == TRACK_STATE_RECORDING || ts.startPending) {
+    interval = 200;   // 5 Hz — clean blink on camera
+  } else {
+    interval = 500;   // 2 Hz — idle/ready, no need for speed
+  }
   if (nowMs - lastUiMs < interval) return;
   lastUiMs = nowMs;
 
@@ -121,7 +129,7 @@ void updateDisplay(uint32_t nowMs) {
 
   // --- Recording (blink header to show activity) ---
   if (ts.trackState == TRACK_STATE_RECORDING || ts.startPending) {
-    bool blink = (nowMs / 200) % 2 == 0;
+    bool blink = (nowMs / 500) % 2 == 0;
     if (blink) {
       // Inverted header: white bar with black text
       u8g2.setDrawColor(1);

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SD.h>
+#include <esp_task_wdt.h>
 
 #include "gps.h"
 #include "imu.h"
@@ -8,12 +9,13 @@
 #include "logging.h"
 #include "pmu.h"
 #include "wifi_server.h"
-#include "lora.h"
 #include "track.h"
 #include "race_logger.h"
 
-static constexpr uint32_t PRINT_INTERVAL_MS = 200;
-static constexpr uint32_t IMU_INTERVAL_MS   = 10;
+static constexpr uint32_t PRINT_INTERVAL_MS      = 200;
+static constexpr uint32_t IMU_INTERVAL_MS         = 10;
+static constexpr uint32_t TRACK_LOG_FLUSH_MS      = 2000;  // flush track CSV every 2s
+static constexpr uint32_t HOUSEKEEPING_INTERVAL_MS = 1000;  // diag flush, WiFi toggle
 
 // ===================== Latest GPS snapshot =====================
 
@@ -186,13 +188,6 @@ void setup() {
   setupWiFi();
   displayBootStatus("API", true);
 
-  // LoRa
-  bool loraOk = initLoRa();
-  displayBootStatus("LoRa", loraOk);
-  if (!loraOk) {
-    Serial.println("[LoRa] Telemetry TX disabled");
-  }
-
   // Track + race logger (no display status — these are logic, not hardware)
   initTrack();
   initRaceLogger();
@@ -202,7 +197,6 @@ void setup() {
   Serial.print("  PMU:  "); Serial.println(pmuOk  ? "OK" : "FAIL");
   Serial.print("  IMU:  "); Serial.println(imuOk  ? "OK" : "FAIL");
   Serial.print("  SD:   "); Serial.println(storageReady ? "OK" : "FAIL");
-  Serial.print("  LoRa: "); Serial.println(loraOk ? "OK" : "FAIL");
   Serial.println("----------------------");
 
   // List SD files for debugging
@@ -226,11 +220,20 @@ void setup() {
 
   displayBootDone();
   diagLog("=== BOOT ===");
-  diagLogf("SD=%s IMU=%s LoRa=%s LOG=%s",
+  diagLogf("SD=%s IMU=%s LOG=%s",
            storageReady ? "OK" : "FAIL",
            imuOk ? "OK" : "FAIL",
-           loraOk ? "OK" : "FAIL",
            loggingEnabled ? "ON" : "OFF");
+
+  // Non-blocking serial: drop data if USB CDC buffer full (no reader).
+  // Must be AFTER all hardware init — setting it earlier breaks SD.begin().
+  // Without this, Serial.print() blocks 100ms per call when no serial
+  // monitor is open, eventually starving the watchdog during main loop.
+  Serial.setTxTimeoutMs(0);
+
+  // Watchdog: reboot if main loop hangs for >5 seconds
+  esp_task_wdt_init(5, true);
+  esp_task_wdt_add(NULL);
 }
 
 // ===================== Main loop =====================
@@ -275,7 +278,7 @@ void loop() {
   if (now - lastImuMs >= IMU_INTERVAL_MS) {
     while (now - lastImuMs >= IMU_INTERVAL_MS) {
       lastImuMs += IMU_INTERVAL_MS;
-      updateImu();
+      if (!isWifiSdBusy()) updateImu();
 
       updateTrack(lastImuMs,
                   gpsFixPulse,
@@ -357,27 +360,44 @@ void loop() {
 
   flushRaceLogger(now);
 
-  // Telemetry + LoRa at PRINT_INTERVAL_MS
+  // Track log flush (every 2s instead of every GPS fix)
+  static uint32_t lastTrackFlushMs = 0;
+  if (now - lastTrackFlushMs >= TRACK_LOG_FLUSH_MS) {
+    lastTrackFlushMs = now;
+    flushTrackLog();
+  }
+
+  // Telemetry at PRINT_INTERVAL_MS
   static uint32_t lastPrintMs = 0;
   if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
     lastPrintMs = now;
     printTelemetry();
-
-    TrackUiState ts = getTrackUiState();
-    sendLoRaTelemetry(latestGps.epoch,
-                      latestGps.lat,
-                      latestGps.lon,
-                      latestGps.alt_m,
-                      latestGps.spd_kmh,
-                      latestGps.hdop,
-                      latestGps.sats,
-                      imuData,
-                      ts.trackState,
-                      ts.lapCount,
-                      ts.currentLapMs,
-                      ts.lastLapMs,
-                      ts.bestLapMs);
   }
 
+  // Housekeeping (1 Hz): diag log flush, WiFi management
+  static uint32_t lastHousekeepMs = 0;
+  static bool wifiOff = false;
+  if (now - lastHousekeepMs >= HOUSEKEEPING_INTERVAL_MS) {
+    lastHousekeepMs = now;
+    if (!isWifiSdBusy()) tickDiagLog();
+
+    // Disable WiFi during recording/racing to eliminate SD SPI bus contention
+    TrackUiState hkState = getTrackUiState();
+    bool needWifiOff = (hkState.trackState == TRACK_STATE_RECORDING ||
+                        hkState.trackState == TRACK_STATE_RACING);
+    if (needWifiOff && !wifiOff) {
+      stopWiFi();
+      wifiOff = true;
+    } else if (!needWifiOff && wifiOff) {
+      restartWiFi();
+      wifiOff = false;
+    }
+  }
+
+  // Process captive portal DNS (keeps macOS/iOS connected to our AP)
+  tickWiFiDNS();
+
   updateDisplay(now);
+
+  esp_task_wdt_reset();
 }

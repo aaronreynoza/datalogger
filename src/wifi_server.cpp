@@ -1,12 +1,15 @@
 #include "wifi_server.h"
 
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
 #include <ESPmDNS.h>
 #include <SD.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
+#include <atomic>
 #include "atp_writer.h"
 #include "device_config.h"
 #include "logging.h"
@@ -15,24 +18,122 @@
 #include "track.h"
 
 static AsyncWebServer server(80);
+
+// ── Selective DNS server ──
+// Only resolves captive-portal check domains to our AP IP.
+// Everything else gets NXDOMAIN so macOS background services fail cleanly
+// at DNS instead of getting fake IPs (which causes broken HTTPS → macOS
+// marks the network as broken and switches to another WiFi).
+static WiFiUDP dnsUdp;
+static bool dnsRunning = false;
+static IPAddress dnsResolveIP;
+
+static bool isCaptiveCheckDomain(const char *name) {
+  return (strcasecmp(name, "captive.apple.com") == 0 ||
+          strcasecmp(name, "www.apple.com") == 0 ||
+          strcasecmp(name, "connectivitycheck.gstatic.com") == 0 ||
+          strcasecmp(name, "clients3.google.com") == 0 ||
+          strcasecmp(name, "www.msftconnecttest.com") == 0 ||
+          strcasecmp(name, "www.msftncsi.com") == 0 ||
+          strcasecmp(name, "detectportal.firefox.com") == 0);
+}
+
+// Parse DNS wire-format name (length-prefixed labels) into dotted string.
+// Returns bytes consumed, 0 on error.
+static int dnsReadName(const uint8_t *buf, int bufLen, int offset,
+                       char *out, int outMax) {
+  int pos = offset, written = 0;
+  while (pos < bufLen) {
+    uint8_t len = buf[pos];
+    if (len == 0) { pos++; break; }
+    if ((len & 0xC0) == 0xC0) { pos += 2; break; } // compression pointer
+    if (len > 63 || pos + 1 + len > bufLen) return 0;
+    if (written > 0 && written < outMax - 1) out[written++] = '.';
+    for (int i = 0; i < len && written < outMax - 1; i++)
+      out[written++] = (char)buf[pos + 1 + i];
+    pos += 1 + len;
+  }
+  out[written] = '\0';
+  return pos - offset;
+}
+
+static void dnsProcessPacket() {
+  int pktLen = dnsUdp.parsePacket();
+  if (pktLen < 12) return;
+
+  uint8_t pkt[512];
+  int len = dnsUdp.read(pkt, sizeof(pkt));
+  if (len < 12) return;
+
+  // Must be a standard query (QR=0, Opcode=0)
+  if (pkt[2] & 0x80) return;
+  if ((pkt[2] >> 3) & 0x0F) return;
+  uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+  if (qdcount < 1) return;
+
+  // Parse first question name
+  char name[128];
+  int nameBytes = dnsReadName(pkt, len, 12, name, sizeof(name));
+  if (nameBytes == 0) return;
+  int qEnd = 12 + nameBytes + 4; // name + qtype(2) + qclass(2)
+  if (qEnd > len) return;
+
+  bool resolve = isCaptiveCheckDomain(name);
+
+  // Build response: copy header + question, set flags
+  uint8_t resp[512];
+  memcpy(resp, pkt, qEnd);
+  resp[2] = 0x81;  // QR=1, RD=1
+  resp[3] = resolve ? 0x80 : 0x83;  // RA=1; rcode=0 or NXDOMAIN(3)
+  resp[6] = 0; resp[7] = resolve ? 1 : 0;  // ANCOUNT
+  resp[8] = 0; resp[9] = 0;   // NSCOUNT
+  resp[10] = 0; resp[11] = 0; // ARCOUNT
+
+  int respLen = qEnd;
+
+  if (resolve) {
+    // A record answer: name-pointer, type A, class IN, TTL 60s, 4-byte IP
+    resp[respLen++] = 0xC0; resp[respLen++] = 0x0C;  // pointer to name
+    resp[respLen++] = 0x00; resp[respLen++] = 0x01;  // TYPE A
+    resp[respLen++] = 0x00; resp[respLen++] = 0x01;  // CLASS IN
+    resp[respLen++] = 0x00; resp[respLen++] = 0x00;
+    resp[respLen++] = 0x00; resp[respLen++] = 0x3C;  // TTL = 60
+    resp[respLen++] = 0x00; resp[respLen++] = 0x04;  // RDLENGTH = 4
+    resp[respLen++] = dnsResolveIP[0];
+    resp[respLen++] = dnsResolveIP[1];
+    resp[respLen++] = dnsResolveIP[2];
+    resp[respLen++] = dnsResolveIP[3];
+  }
+
+  dnsUdp.beginPacket(dnsUdp.remoteIP(), dnsUdp.remotePort());
+  dnsUdp.write(resp, respLen);
+  dnsUdp.endPacket();
+}
 static WifiGpsStatus gpsStatus = {false, 0, 99.0f, 0.0f};
+
+// SPI bus guard — prevents main loop IMU reads while HTTP handlers use SD.
+// Both IMU and SD share the HSPI bus; concurrent access blocks the main loop
+// on the SPI driver's internal mutex, triggering the 5-second watchdog.
+static std::atomic<bool> _sdBusy{false};
+
+struct SdBusyGuard {
+  SdBusyGuard()  { _sdBusy.store(true, std::memory_order_release); }
+  ~SdBusyGuard() { _sdBusy.store(false, std::memory_order_release); }
+};
+
+bool isWifiSdBusy() { return _sdBusy.load(std::memory_order_acquire); }
 
 // ── Cached storage stats (SD.totalBytes/usedBytes are very slow on SPI) ──
 static uint32_t cachedTotalMB = 0;
 static uint32_t cachedUsedMB = 0;
 static uint32_t cachedFreeMB = 0;
-static uint32_t lastStorageCacheMs = 0;
-static const uint32_t STORAGE_CACHE_TTL_MS = 30000; // refresh every 30s
-
 static void refreshStorageCache() {
-  uint32_t now = millis();
-  if (cachedTotalMB > 0 && (now - lastStorageCacheMs) < STORAGE_CACHE_TTL_MS) return;
+  if (cachedTotalMB > 0) return;  // Computed once at boot; stable while WiFi is active
   uint64_t totalBytes = SD.totalBytes();
   uint64_t usedBytes = SD.usedBytes();
   cachedTotalMB = (uint32_t)(totalBytes / (1024 * 1024));
   cachedUsedMB  = (uint32_t)(usedBytes / (1024 * 1024));
   cachedFreeMB  = (uint32_t)((totalBytes - usedBytes) / (1024 * 1024));
-  lastStorageCacheMs = now;
 }
 
 void updateWifiGpsStatus(bool fix, uint32_t sats, float hdop, float speedKmh) {
@@ -87,6 +188,7 @@ static int batteryPercentFromVoltage(uint16_t mv) {
 // ===================== GET /api/v1/device =====================
 
 static void handleDevice(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   const DeviceConfig &cfg = getConfig();
   TrackUiState ts = getTrackUiState();
 
@@ -130,7 +232,37 @@ static void handleDevice(AsyncWebServerRequest *request) {
 
 // ===================== GET /api/v1/sessions =====================
 
+// Format epoch milliseconds to ISO 8601 string. Returns false if startTimeMs==0.
+static bool epochToISO(uint64_t startTimeMs, char *buf, size_t bufLen) {
+  if (startTimeMs == 0) return false;
+  uint32_t epochS = (uint32_t)(startTimeMs / 1000);
+  uint32_t sec = epochS;
+  int ss = sec % 60; sec /= 60;
+  int mm = sec % 60; sec /= 60;
+  int hh = sec % 24;
+  uint32_t days = sec / 24;
+  int year = 1970;
+  while (true) {
+    int diy = ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) ? 366 : 365;
+    if (days < (uint32_t)diy) break;
+    days -= diy;
+    year++;
+  }
+  static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  int mon = 1;
+  for (int i = 0; i < 12; i++) {
+    int d = dim[i];
+    if (i == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) d++;
+    if (days < (uint32_t)d) { mon = i + 1; break; }
+    days -= d;
+  }
+  snprintf(buf, bufLen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           year, mon, (int)days + 1, hh, mm, ss);
+  return true;
+}
+
 static void handleSessions(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   JsonDocument doc;
   JsonArray sessions = doc["sessions"].to<JsonArray>();
   int total = 0;
@@ -179,62 +311,23 @@ static void handleSessions(AsyncWebServerRequest *request) {
         if (meta.complete) {
           s["duration_ms"] = meta.durationMs;
           s["laps"] = meta.totalLaps;
-
-          // Find best lap time
-          AtpLapInfo lapBuf[64];
-          uint16_t lapCount = atpReadLaps(path.c_str(), lapBuf, 64);
-          uint32_t bestMs = UINT32_MAX;
-          for (uint16_t li = 0; li < lapCount; ++li) {
-            if (lapBuf[li].timeMs > 0 && lapBuf[li].timeMs < bestMs)
-              bestMs = lapBuf[li].timeMs;
-          }
-          if (bestMs < UINT32_MAX) s["best_lap_ms"] = bestMs;
-        } else {
-          // Incomplete session — scan chunks for estimated duration
-          AtpScanResult scan;
-          if (atpScanChunks(path.c_str(), scan)) {
-            s["duration_ms"] = scan.lastTimestampMs;
-            s["chunks"] = scan.chunkCount;
-          }
         }
+        // Incomplete sessions: skip chunk scan (too slow for listing).
+        // Desktop reads the full ATP file anyway — duration extracted on import.
 
         // Channels (static for Core Pro)
         JsonArray ch = s["channels"].to<JsonArray>();
         ch.add("imu");
         ch.add("gps");
 
-        if (meta.startTimeMs > 0) {
-          // Format ISO 8601 timestamp
-          uint32_t epochS = (uint32_t)(meta.startTimeMs / 1000);
-          char timeBuf[32];
-          // Simple epoch to ISO conversion
-          uint32_t sec = epochS;
-          int ss = sec % 60; sec /= 60;
-          int mm = sec % 60; sec /= 60;
-          int hh = sec % 24;
-          uint32_t days = sec / 24;
-          int year = 1970;
-          while (true) {
-            int diy = ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) ? 366 : 365;
-            if (days < (uint32_t)diy) break;
-            days -= diy;
-            year++;
-          }
-          static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-          int mon = 1;
-          for (int i = 0; i < 12; i++) {
-            int d = dim[i];
-            if (i == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) d++;
-            if (days < (uint32_t)d) { mon = i + 1; break; }
-            days -= d;
-          }
-          snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                   year, mon, (int)days + 1, hh, mm, ss);
+        char timeBuf[32];
+        if (epochToISO(meta.startTimeMs, timeBuf, sizeof(timeBuf))) {
           s["start_time"] = timeBuf;
         }
       }
 
       total++;
+      yield();  // Let WiFi stack + watchdog breathe between files
       file = root.openNextFile();
       continue;
     }
@@ -248,7 +341,14 @@ static void handleSessions(AsyncWebServerRequest *request) {
 
 // ===================== GET /api/v1/sessions/{id}/data =====================
 
+// Holds file data in PSRAM for async streaming (avoids SPI bus contention with IMU).
+struct PsramFileData {
+  uint8_t *buf;
+  size_t   len;
+};
+
 static void handleSessionDownload(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   // Extract session ID from the URI: /api/v1/sessions/{id}/data
   String uri = request->url();
   int sessStart = strlen("/api/v1/sessions/");
@@ -260,13 +360,45 @@ static void handleSessionDownload(AsyncWebServerRequest *request) {
   String sessionId = uri.substring(sessStart, dataPos);
   String filename = "/" + sessionId + ".atp";
 
-  if (!SD.exists(filename)) {
+  // Read entire file into PSRAM synchronously (SPI works fine in handler context).
+  // Streaming directly from SD via beginResponse(SD, ...) hangs because the async
+  // TCP task's SD reads conflict with the main loop's IMU SPI reads on the same bus.
+  File f = SD.open(filename, "r");
+  if (!f) {
     sendError(request, 404, "not_found", "Session not found");
     return;
   }
+  size_t sz = f.size();
+  uint8_t *data = (uint8_t *)ps_malloc(sz);
+  if (!data) {
+    f.close();
+    sendError(request, 500, "memory_error", "Out of PSRAM");
+    return;
+  }
+  size_t bytesRead = f.read(data, sz);
+  f.close();
 
+  Serial.printf("[WiFi] Streaming %s (%u bytes from PSRAM)\n", filename.c_str(), bytesRead);
+
+  // Stream from PSRAM buffer — no more SD/SPI access needed.
+  // Cleanup via onDisconnect to avoid use-after-free in the streaming callback.
+  PsramFileData *fd = new PsramFileData{data, bytesRead};
+  request->onDisconnect([fd]() {
+    if (fd->buf) free(fd->buf);
+    delete fd;
+  });
+
+  AsyncWebServerResponse *response = request->beginResponse(
+    "application/octet-stream", bytesRead,
+    [fd](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= fd->len) return 0;
+      size_t remaining = fd->len - index;
+      size_t toSend = (remaining < maxLen) ? remaining : maxLen;
+      memcpy(buffer, fd->buf + index, toSend);
+      return toSend;
+    }
+  );
   String dispName = sessionId + ".atp";
-  AsyncWebServerResponse *response = request->beginResponse(SD, filename, "application/octet-stream");
   response->addHeader("Content-Disposition", "attachment; filename=\"" + dispName + "\"");
   request->send(response);
 }
@@ -305,27 +437,19 @@ static const ChannelInfo CHANNEL_TABLE[] = {
 static constexpr uint16_t NUM_API_CHANNELS = sizeof(CHANNEL_TABLE) / sizeof(CHANNEL_TABLE[0]);
 
 static void handleSessionDetail(AsyncWebServerRequest *request, const String &sessionId) {
+  SdBusyGuard guard;
   String filename = "/" + sessionId + ".atp";
-
-  if (!SD.exists(filename)) {
-    sendError(request, 404, "not_found", "Session not found");
-    return;
-  }
 
   AtpFileMeta meta;
   if (!atpReadMeta(filename.c_str(), meta)) {
-    sendError(request, 500, "read_error", "Failed to read session metadata");
+    sendError(request, 404, "not_found", "Session not found or unreadable");
     return;
   }
-
-  File f = SD.open(filename, "r");
-  size_t fileSize = f ? f.size() : 0;
-  if (f) f.close();
 
   JsonDocument doc;
   doc["id"] = sessionId;
   doc["filename"] = sessionId + ".atp";
-  doc["size_bytes"] = fileSize;
+  doc["size_bytes"] = meta.fileSize;
   doc["driver"] = meta.driverName;
   doc["vehicle"] = meta.vehicleName;
   doc["track"] = meta.trackName;
@@ -335,43 +459,16 @@ static void handleSessionDetail(AsyncWebServerRequest *request, const String &se
 
   if (meta.complete) {
     doc["duration_ms"] = meta.durationMs;
-  } else {
-    AtpScanResult scan;
-    if (atpScanChunks(filename.c_str(), scan)) {
-      doc["duration_ms"] = scan.lastTimestampMs;
-      doc["chunks"] = scan.chunkCount;
-    }
   }
+  // Incomplete sessions: skip chunk scan (too slow over SPI).
+  // Desktop reads the full ATP file — duration extracted on import.
 
-  if (meta.startTimeMs > 0) {
-    uint32_t epochS = (uint32_t)(meta.startTimeMs / 1000);
-    char timeBuf[32];
-    uint32_t sec = epochS;
-    int ss = sec % 60; sec /= 60;
-    int mm = sec % 60; sec /= 60;
-    int hh = sec % 24;
-    uint32_t days = sec / 24;
-    int year = 1970;
-    while (true) {
-      int diy = ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) ? 366 : 365;
-      if (days < (uint32_t)diy) break;
-      days -= diy;
-      year++;
-    }
-    static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    int mon = 1;
-    for (int i = 0; i < 12; i++) {
-      int d = dim[i];
-      if (i == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) d++;
-      if (days < (uint32_t)d) { mon = i + 1; break; }
-      days -= d;
-    }
-    snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             year, mon, (int)days + 1, hh, mm, ss);
+  char timeBuf[32];
+  if (epochToISO(meta.startTimeMs, timeBuf, sizeof(timeBuf))) {
     doc["start_time"] = timeBuf;
   }
 
-  // Channel table
+  // Channel table (static, no SD access needed)
   JsonArray channels = doc["channels"].to<JsonArray>();
   for (uint16_t i = 0; i < NUM_API_CHANNELS; ++i) {
     JsonObject ch = channels.add<JsonObject>();
@@ -381,7 +478,7 @@ static void handleSessionDetail(AsyncWebServerRequest *request, const String &se
     ch["rate_hz"] = CHANNEL_TABLE[i].rateHz;
   }
 
-  // Lap table (only available for complete sessions with footer)
+  // Lap table (only for complete sessions — requires one more SD read)
   JsonArray lapsArr = doc["laps"].to<JsonArray>();
   if (meta.complete) {
     AtpLapInfo lapBuf[64];
@@ -411,6 +508,7 @@ static void handleSessionDetail(AsyncWebServerRequest *request, const String &se
 // ===================== GET /api/v1/tracks =====================
 
 static void handleGetTracks(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   JsonDocument doc;
   JsonArray tracks = doc["tracks"].to<JsonArray>();
 
@@ -579,6 +677,7 @@ static void handleSetConfig(AsyncWebServerRequest *request, JsonVariant &json) {
 // ===================== GET /api/v1/live/status =====================
 
 static void handleLiveStatus(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   TrackUiState ts = getTrackUiState();
 
   JsonDocument doc;
@@ -632,6 +731,7 @@ static void handleDebug(AsyncWebServerRequest *request) {
 // ===================== GET / (legacy root page) =====================
 
 static void handleRoot(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   const DeviceConfig &cfg = getConfig();
   TrackUiState ts = getTrackUiState();
 
@@ -692,26 +792,101 @@ static void handleRoot(AsyncWebServerRequest *request) {
 // ===================== Legacy CSV download (for track recordings) =====================
 
 static void handleLogDownload(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   if (!request->hasParam("file")) {
     request->send(400, "text/plain", "Missing ?file=");
     return;
   }
   String fname = request->getParam("file")->value();
   if (!fname.startsWith("/")) fname = "/" + fname;
-  if (!SD.exists(fname)) {
+
+  File f = SD.open(fname, "r");
+  if (!f) {
     request->send(404, "text/plain", "File not found");
     return;
   }
+  size_t sz = f.size();
+  uint8_t *data = (uint8_t *)ps_malloc(sz);
+  if (!data) {
+    f.close();
+    request->send(500, "text/plain", "Out of memory");
+    return;
+  }
+  size_t bytesRead = f.read(data, sz);
+  f.close();
+
   String dispName = fname;
   if (dispName.startsWith("/")) dispName.remove(0, 1);
-  AsyncWebServerResponse *response = request->beginResponse(SD, fname, "text/csv");
+
+  PsramFileData *fd = new PsramFileData{data, bytesRead};
+  request->onDisconnect([fd]() {
+    if (fd->buf) free(fd->buf);
+    delete fd;
+  });
+
+  AsyncWebServerResponse *response = request->beginResponse(
+    "text/csv", bytesRead,
+    [fd](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= fd->len) return 0;
+      size_t remaining = fd->len - index;
+      size_t toSend = (remaining < maxLen) ? remaining : maxLen;
+      memcpy(buffer, fd->buf + index, toSend);
+      return toSend;
+    }
+  );
   response->addHeader("Content-Disposition", "attachment; filename=\"" + dispName + "\"");
   request->send(response);
+}
+
+// ===================== Captive portal (keeps macOS/iOS/Android connected) =====================
+
+static const char CAPTIVE_SUCCESS[] PROGMEM =
+  "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+
+static bool handleCaptivePortal(AsyncWebServerRequest *request) {
+  String uri = request->url();
+  String host = request->host();
+
+  // Apple connectivity check
+  if (uri == "/hotspot-detect.html" ||
+      uri == "/library/test/success.html" ||
+      host == "captive.apple.com" ||
+      host == "www.apple.com") {
+    request->send(200, "text/html", CAPTIVE_SUCCESS);
+    return true;
+  }
+
+  // Android / Chrome connectivity check
+  if (uri == "/generate_204" || uri == "/gen_204") {
+    request->send(204);
+    return true;
+  }
+
+  // Windows connectivity check
+  if (uri == "/connecttest.txt") {
+    request->send(200, "text/plain", "Microsoft Connect Test");
+    return true;
+  }
+  if (uri == "/redirect") {
+    request->send(200, "text/html", CAPTIVE_SUCCESS);
+    return true;
+  }
+
+  // Firefox connectivity check
+  if (uri == "/success.txt") {
+    request->send(200, "text/plain", "success");
+    return true;
+  }
+
+  return false;
 }
 
 // ===================== Route not found =====================
 
 static void handleNotFound(AsyncWebServerRequest *request) {
+  // Captive portal detection (macOS, iOS, Android, Windows, Firefox)
+  if (handleCaptivePortal(request)) return;
+
   String uri = request->url();
 
   // CORS preflight for any API route
@@ -720,6 +895,11 @@ static void handleNotFound(AsyncWebServerRequest *request) {
     return;
   }
 
+  // Session routes: listing, detail, and download (all under /api/v1/sessions)
+  if (uri == "/api/v1/sessions" && request->method() == HTTP_GET) {
+    handleSessions(request);
+    return;
+  }
   if (uri.startsWith("/api/v1/sessions/") && request->method() == HTTP_GET) {
     int sessStart = strlen("/api/v1/sessions/");
     // GET /api/v1/sessions/{id}/data — binary download
@@ -756,6 +936,7 @@ void setupWiFi() {
     Serial.println("[WiFi] AP start FAILED");
     return;
   }
+  WiFi.setSleep(false);  // Disable WiFi power saving for reliable HTTP responses
   IPAddress ip = WiFi.softAPIP();
   Serial.print("[WiFi] AP: "); Serial.print(ssid);
   Serial.print("  pass="); Serial.println(password);
@@ -776,6 +957,14 @@ void setupWiFi() {
     Serial.println("[mDNS] start FAILED");
   }
 
+  // Selective captive portal DNS — only resolves portal-check domains.
+  // Non-portal domains get NXDOMAIN (clean failure) instead of fake IPs
+  // (which cause broken HTTPS and trigger macOS WiFi switching).
+  dnsResolveIP = apIP;
+  dnsUdp.begin(53);
+  dnsRunning = true;
+  Serial.println("[WiFi] Selective DNS started (captive portal domains only)");
+
   // Pre-warm storage cache so first request is fast
   refreshStorageCache();
 
@@ -786,7 +975,9 @@ void setupWiFi() {
 
   // API v1 GET endpoints
   server.on("/api/v1/device",      HTTP_GET, handleDevice);
-  server.on("/api/v1/sessions",    HTTP_GET, handleSessions);
+  // NOTE: /api/v1/sessions is handled in handleNotFound because ESPAsyncWebServer
+  // does prefix matching — registering it here would intercept /sessions/{id} and
+  // /sessions/{id}/data requests too.
   server.on("/api/v1/tracks",      HTTP_GET, handleGetTracks);
   server.on("/api/v1/config",      HTTP_GET, handleGetConfig);
   server.on("/api/v1/live/status", HTTP_GET, handleLiveStatus);
@@ -817,4 +1008,23 @@ void setupWiFi() {
 
   server.begin();
   Serial.println("[WiFi] Async HTTP server started on port 80");
+}
+
+void stopWiFi() {
+  if (dnsRunning) {
+    dnsUdp.stop();
+    dnsRunning = false;
+  }
+  server.end();
+  WiFi.mode(WIFI_OFF);
+  Serial.println("[WiFi] OFF — SD bus freed for recording");
+}
+
+void tickWiFiDNS() {
+  if (dnsRunning) dnsProcessPacket();
+}
+
+void restartWiFi() {
+  // Re-setup WiFi AP + server (setupWiFi handles everything)
+  setupWiFi();
 }

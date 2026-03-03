@@ -15,6 +15,7 @@ void appendTrackLog(uint32_t epoch,
                     double lat, double lon, double alt_m,
                     double spd_kmph, double course_deg,
                     double hdop, uint32_t sats);
+void flushTrackLog();
 
 void dumpFile(const String &path);
 void clearLogs();
@@ -23,4 +24,6 @@ void listLogsTo(Print &out);
 // Persistent diagnostic log (survives power cycles)
 void diagLog(const char *msg);
 void diagLogf(const char *fmt, ...);
+void flushDiagLog();
+void tickDiagLog();
 String readDiagLog();

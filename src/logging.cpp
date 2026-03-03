@@ -76,27 +76,32 @@ void appendTrackLog(uint32_t epoch,
                     double hdop, uint32_t sats) {
   if (!storageReady || !loggingEnabled || !trackLogOpen) return;
 
-  String line;
-  line.reserve(120);
-  if (epoch) line += String(epoch);
-  line += ",";
-  line += String(millis());
-  line += ",";
-  if (!isnan(lat)) line += String(lat, 6);
-  line += ",";
-  if (!isnan(lon)) line += String(lon, 6);
-  line += ",";
-  if (!isnan(alt_m)) line += String(alt_m, 2);
-  line += ",";
-  if (!isnan(spd_kmph)) line += String(spd_kmph, 2);
-  line += ",";
-  if (!isnan(course_deg)) line += String(course_deg, 2);
-  line += ",";
-  if (!isnan(hdop)) line += String(hdop, 2);
-  line += ",";
-  if (sats) line += String(sats);
-  trackFile.println(line);
-  trackFile.flush();
+  char buf[160];
+  char *p = buf;
+  char *end = buf + sizeof(buf);
+
+  if (epoch) p += snprintf(p, end - p, "%lu", (unsigned long)epoch);
+  p += snprintf(p, end - p, ",%lu,", (unsigned long)millis());
+  if (!isnan(lat)) p += snprintf(p, end - p, "%.6f", lat);
+  *p++ = ',';
+  if (!isnan(lon)) p += snprintf(p, end - p, "%.6f", lon);
+  *p++ = ',';
+  if (!isnan(alt_m)) p += snprintf(p, end - p, "%.2f", alt_m);
+  *p++ = ',';
+  if (!isnan(spd_kmph)) p += snprintf(p, end - p, "%.2f", spd_kmph);
+  *p++ = ',';
+  if (!isnan(course_deg)) p += snprintf(p, end - p, "%.2f", course_deg);
+  *p++ = ',';
+  if (!isnan(hdop)) p += snprintf(p, end - p, "%.2f", hdop);
+  *p++ = ',';
+  if (sats) p += snprintf(p, end - p, "%lu", (unsigned long)sats);
+  *p = '\0';
+
+  trackFile.println(buf);
+}
+
+void flushTrackLog() {
+  if (trackLogOpen) trackFile.flush();
 }
 
 void dumpFile(const String &path) {
@@ -141,16 +146,20 @@ void clearLogs() {
 static const char *DIAG_LOG_FILE = "/diag.log";
 static constexpr size_t DIAG_MAX_SIZE = 8192;  // 8 KB max, truncate old entries
 
-void diagLog(const char *msg) {
-  if (!storageReady) return;
+static char diagBuf[2048];
+static size_t diagBufPos = 0;
+static uint32_t lastDiagFlushMs = 0;
+static constexpr uint32_t DIAG_FLUSH_INTERVAL_MS = 5000;
 
-  // Truncate if too large (keep last half)
+void flushDiagLog() {
+  if (!storageReady || diagBufPos == 0) return;
+
+  // Truncate if file too large (keep last half)
   File check = SD.open(DIAG_LOG_FILE, "r");
   if (check) {
     size_t sz = check.size();
     check.close();
     if (sz > DIAG_MAX_SIZE) {
-      // Read last half, rewrite
       File r = SD.open(DIAG_LOG_FILE, "r");
       r.seek(sz - DIAG_MAX_SIZE / 2);
       String keep;
@@ -167,15 +176,38 @@ void diagLog(const char *msg) {
 
   File f = SD.open(DIAG_LOG_FILE, "a");
   if (!f) return;
+  f.write((const uint8_t *)diagBuf, diagBufPos);
+  f.close();
+  diagBufPos = 0;
+  lastDiagFlushMs = millis();
+}
 
-  // Write boot-relative timestamp
+void tickDiagLog() {
+  if (diagBufPos > 0 && millis() - lastDiagFlushMs >= DIAG_FLUSH_INTERVAL_MS) {
+    flushDiagLog();
+  }
+}
+
+void diagLog(const char *msg) {
+  if (!storageReady) return;
+
   uint32_t sec = millis() / 1000;
   char timeBuf[16];
-  snprintf(timeBuf, sizeof(timeBuf), "[%lu.%lus] ",
-           (unsigned long)(sec / 60), (unsigned long)(sec % 60));
-  f.print(timeBuf);
-  f.println(msg);
-  f.close();
+  int tLen = snprintf(timeBuf, sizeof(timeBuf), "[%lu.%lus] ",
+                      (unsigned long)(sec / 60), (unsigned long)(sec % 60));
+
+  size_t msgLen = strlen(msg);
+  size_t needed = tLen + msgLen + 1;  // +1 for newline
+
+  if (diagBufPos + needed >= sizeof(diagBuf)) {
+    flushDiagLog();  // buffer full, force flush
+  }
+
+  memcpy(diagBuf + diagBufPos, timeBuf, tLen);
+  diagBufPos += tLen;
+  memcpy(diagBuf + diagBufPos, msg, msgLen);
+  diagBufPos += msgLen;
+  diagBuf[diagBufPos++] = '\n';
 }
 
 void diagLogf(const char *fmt, ...) {
@@ -189,6 +221,7 @@ void diagLogf(const char *fmt, ...) {
 
 String readDiagLog() {
   if (!storageReady) return "SD not ready";
+  flushDiagLog();  // write pending messages first
   File f = SD.open(DIAG_LOG_FILE, "r");
   if (!f) return "No diagnostic log";
   String content;

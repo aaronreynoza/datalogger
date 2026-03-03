@@ -12,12 +12,14 @@ static constexpr int TRACK_BUTTON_PIN = 0;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 40;
 
 // --- Detection thresholds ---
-static constexpr double TRACK_RADIUS_M       = 30.0;   // crossing proximity (needs to be wide for 1Hz GPS at speed)
-static constexpr double TRACK_LEAVE_RADIUS_M = 20.0;   // must leave this far before re-crossing counts
-static constexpr double COURSE_TOLERANCE_DEG  = 45.0;   // heading tolerance (wider for bike/GPS noise)
+static constexpr double TRACK_RADIUS_M        = 12.0;   // proximity for RECORDING circuit detection
+static constexpr double MIN_CROSSING_DIST_M   = 50.0;   // cumulative distance required between crossings
+static constexpr double GATE_HALF_WIDTH_M     = 15.0;   // half-width of start/finish gate (30m total)
+// TODO: increase to 25.0 km/h for production — 5 km/h is for neighborhood testing only
 static constexpr double MIN_SPEED_KMH         = 5.0;
 static constexpr uint32_t MIN_LAP_MS          = 5000;
-static constexpr double AUTO_DETECT_RADIUS_M  = 500.0;
+static constexpr double AUTO_DETECT_RADIUS_M  = 1000.0; // wide enough to catch paddock areas
+static constexpr double CIRCUIT_HEADING_TOL_DEG = 90.0; // reject wrong-way passes during RECORDING
 
 // --- Multi-track storage ---
 static constexpr int MAX_TRACKS = 16;
@@ -40,7 +42,12 @@ static int numSavedTracks = 0;
 static uint8_t  trackState      = TRACK_STATE_IDLE;
 static bool     lapActive       = false;
 static bool     startPending    = false;
-static bool     leftStartRadius = false;
+// --- Previous GPS position (for line-segment crossing) ---
+static double   prevGpsLat      = NAN;
+static double   prevGpsLon      = NAN;
+
+// --- Cumulative distance tracking (replaces leave-radius) ---
+static double   cumulativeDistM = 0.0;
 
 static double   startLat        = NAN;
 static double   startLon        = NAN;
@@ -94,15 +101,73 @@ static uint32_t fnv1a(const uint8_t *data, size_t len) {
   return hash;
 }
 
-static uint32_t computeTrackId(double lat, double lon, double alt) {
-  int32_t lat_i = static_cast<int32_t>(lround(lat * 1e6));
-  int32_t lon_i = static_cast<int32_t>(lround(lon * 1e6));
-  int32_t alt_i = isnan(alt) ? 0 : static_cast<int32_t>(lround(alt * 100));
-  uint8_t buf[12];
+static uint32_t computeTrackId(double lat, double lon, double /* alt */) {
+  // Quantize to 4 decimal places (~11m resolution) for stable hashing.
+  // Altitude excluded — GPS alt varies 20-50m between sessions, causing
+  // the same track to get different IDs.
+  int32_t lat_i = static_cast<int32_t>(lround(lat * 1e4));
+  int32_t lon_i = static_cast<int32_t>(lround(lon * 1e4));
+  uint8_t buf[8];
   memcpy(buf, &lat_i, sizeof(lat_i));
   memcpy(buf + 4, &lon_i, sizeof(lon_i));
-  memcpy(buf + 8, &alt_i, sizeof(alt_i));
   return fnv1a(buf, sizeof(buf));
+}
+
+// ===================== Line-segment crossing math =====================
+
+// Project lat/lon to local X/Y meters relative to a reference point.
+// Equirectangular approximation — accurate within ~10km of reference.
+static void latLonToXY(double lat, double lon,
+                       double refLat, double refLon,
+                       double &xM, double &yM) {
+  static constexpr double R = 6371000.0;
+  double latRad = deg2rad(refLat);
+  xM = deg2rad(lon - refLon) * R * cos(latRad);
+  yM = deg2rad(lat - refLat) * R;
+}
+
+// 2D cross product: (B-A) x (C-A). Positive = C is left of A->B.
+static double cross2D(double ax, double ay,
+                      double bx, double by,
+                      double cx, double cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+// Test whether trajectory P1->P2 crosses gate Q1->Q2.
+// checkDirection: if true, only accept crossings where P1 is on the "right"
+// side of Q1->Q2 (approaching from the expected direction).
+// crossFrac: fractional position along P1->P2 where crossing occurs [0..1].
+static bool segmentsCross(double p1x, double p1y, double p2x, double p2y,
+                          double q1x, double q1y, double q2x, double q2y,
+                          bool checkDirection,
+                          double &crossFrac) {
+  double d1 = cross2D(q1x, q1y, q2x, q2y, p1x, p1y);
+  double d2 = cross2D(q1x, q1y, q2x, q2y, p2x, p2y);
+  if (d1 * d2 > 0.0) return false;  // same side — no crossing
+
+  double d3 = cross2D(p1x, p1y, p2x, p2y, q1x, q1y);
+  double d4 = cross2D(p1x, p1y, p2x, p2y, q2x, q2y);
+  if (d3 * d4 > 0.0) return false;  // trajectory misses gate
+
+  // Direction: d1 > 0 means P1 is on the approach side of the gate
+  // (behind the start line relative to the racing direction)
+  if (checkDirection && d1 <= 0.0) return false;
+
+  double denom = d1 - d2;
+  crossFrac = (fabs(denom) < 1e-12) ? 0.5 : (d1 / denom);
+  return true;
+}
+
+// Compute gate endpoints perpendicular to startCourseDeg, in local XY.
+// Start point is at origin (0,0).
+static void computeGateEndpoints(double courseDeg,
+                                  double &q1x, double &q1y,
+                                  double &q2x, double &q2y) {
+  double perpRad = deg2rad(courseDeg + 90.0);
+  double dx = GATE_HALF_WIDTH_M * sin(perpRad);
+  double dy = GATE_HALF_WIDTH_M * cos(perpRad);
+  q1x =  dx;  q1y =  dy;   // left endpoint
+  q2x = -dx;  q2y = -dy;   // right endpoint
 }
 
 // ===================== Track persistence =====================
@@ -247,15 +312,17 @@ static void loadTrackByIndex(int idx) {
   startAlt      = t.alt;
   startCourseDeg = t.courseDeg;
   trackId       = t.id;
-  trackState    = TRACK_STATE_READY;
-  lapActive     = false;
-  startPending  = false;
-  leftStartRadius = false;
-  lapStartMs    = 0;
-  currentLapMs  = 0;
-  lastLapMs     = 0;
-  bestLapMs     = 0;
-  lapCount      = 0;
+  trackState      = TRACK_STATE_READY;
+  lapActive       = false;
+  startPending    = false;
+  cumulativeDistM = 0.0;
+  prevGpsLat      = NAN;
+  prevGpsLon      = NAN;
+  lapStartMs      = 0;
+  currentLapMs    = 0;
+  lastLapMs       = 0;
+  bestLapMs       = 0;
+  lapCount        = 0;
   Serial.print("[TRACK] Auto-detected track ID ");
   Serial.println(trackId);
 }
@@ -264,34 +331,84 @@ static void loadTrackByIndex(int idx) {
 
 static uint32_t lastCrossDebugMs = 0;
 
-static bool isCrossingStart(double lat, double lon, double spdKmh, double courseDeg) {
-  if (isnan(startLat) || isnan(startLon) || isnan(startCourseDeg)) return false;
-  if (isnan(courseDeg)) return false;
+// Circuit detection during RECORDING: proximity + cumulative distance + heading.
+// Heading tolerance is 90° — generous enough for GPS noise at 5 km/h,
+// restrictive enough to reject wrong-way passes (180° delta).
+static bool isCircuitComplete(double lat, double lon,
+                               double spdKmh, double courseDeg) {
+  if (isnan(startLat) || isnan(startLon)) return false;
+  if (spdKmh < MIN_SPEED_KMH) return false;
+  if (cumulativeDistM < MIN_CROSSING_DIST_M) return false;
+
+  // Heading check: reject opposite-direction passes through start.
+  // Both initial and current course are above MIN_SPEED_KMH, so GPS course
+  // is reliable enough to distinguish same-way (~0° delta) from wrong-way (~180°).
+  if (!isnan(startCourseDeg)) {
+    double hdgDelta = courseDelta(courseDeg, startCourseDeg);
+    if (hdgDelta > CIRCUIT_HEADING_TOL_DEG) return false;
+  }
 
   double dist = distanceMeters(lat, lon, startLat, startLon);
-  double hdgDelta = courseDelta(courseDeg, startCourseDeg);
 
   // Debug print every 2 seconds when near start
   uint32_t now = millis();
   if (dist < 100.0 && now - lastCrossDebugMs > 2000) {
     lastCrossDebugMs = now;
-    Serial.print("[CROSS] dist=");
+    Serial.print("[REC-CROSS] dist=");
     Serial.print(dist, 1);
     Serial.print("m spd=");
     Serial.print(spdKmh, 1);
-    Serial.print("km/h hdg=");
-    Serial.print(courseDeg, 1);
-    Serial.print(" start_hdg=");
-    Serial.print(startCourseDeg, 1);
-    Serial.print(" delta=");
-    Serial.print(hdgDelta, 1);
-    Serial.print(" left=");
-    Serial.println(leftStartRadius ? "Y" : "N");
+    Serial.print("km/h cumDist=");
+    Serial.print(cumulativeDistM, 0);
+    Serial.print("m hdgDelta=");
+    Serial.print(courseDelta(courseDeg, startCourseDeg), 1);
+    Serial.println("deg");
   }
 
+  return dist <= TRACK_RADIUS_M;
+}
+
+// Start-line crossing during READY/RACING: line-segment intersection.
+// Tests trajectory (prevGps -> currentGps) against the start/finish gate.
+static bool isCrossingStartLine(double lat, double lon,
+                                 double pLat, double pLon,
+                                 double spdKmh, double &crossFrac) {
+  if (isnan(startLat) || isnan(startLon) || isnan(startCourseDeg)) return false;
+  if (isnan(pLat) || isnan(pLon)) return false;
   if (spdKmh < MIN_SPEED_KMH) return false;
-  if (dist > TRACK_RADIUS_M) return false;
-  return hdgDelta <= COURSE_TOLERANCE_DEG;
+  if (cumulativeDistM < MIN_CROSSING_DIST_M) return false;
+
+  // Project into local XY relative to start point
+  double p1x, p1y, p2x, p2y;
+  latLonToXY(pLat, pLon, startLat, startLon, p1x, p1y);
+  latLonToXY(lat, lon, startLat, startLon, p2x, p2y);
+
+  // Quick reject: both points far from gate
+  double maxDist = fmax(fabs(p1x) + fabs(p1y), fabs(p2x) + fabs(p2y));
+  if (maxDist > GATE_HALF_WIDTH_M * 3.0) return false;
+
+  // Debug print every 2 seconds when near start
+  uint32_t now = millis();
+  if (now - lastCrossDebugMs > 2000) {
+    lastCrossDebugMs = now;
+    Serial.print("[CROSS] p1=(");
+    Serial.print(p1x, 1); Serial.print(","); Serial.print(p1y, 1);
+    Serial.print(") p2=(");
+    Serial.print(p2x, 1); Serial.print(","); Serial.print(p2y, 1);
+    Serial.print(") cumDist=");
+    Serial.print(cumulativeDistM, 0);
+    Serial.print("m spd=");
+    Serial.print(spdKmh, 1);
+    Serial.println("km/h");
+  }
+
+  // Compute gate endpoints
+  double q1x, q1y, q2x, q2y;
+  computeGateEndpoints(startCourseDeg, q1x, q1y, q2x, q2y);
+
+  return segmentsCross(p1x, p1y, p2x, p2y,
+                       q1x, q1y, q2x, q2y,
+                       true, crossFrac);
 }
 
 // ===================== Recording =====================
@@ -303,7 +420,9 @@ static void beginTrackRecording() {
   trackState      = TRACK_STATE_RECORDING;
   lapActive       = false;
   startPending    = false;
-  leftStartRadius = false;
+  cumulativeDistM = 0.0;
+  prevGpsLat      = NAN;
+  prevGpsLon      = NAN;
   startLocked     = false;
   lapStartMs      = 0;
   currentLapMs    = 0;
@@ -337,7 +456,7 @@ static void finishTrackRecording() {
   saveOrUpdateTrack(startLat, startLon, startAlt, startCourseDeg, trackId);
   trackState      = TRACK_STATE_READY;
   lapActive       = false;
-  leftStartRadius = false;
+  cumulativeDistM = 0.0;
   startPending    = false;
   Serial.print("[TRACK] Recording finished, track ID ");
   Serial.println(trackId);
@@ -365,6 +484,7 @@ void pollTrackButton(uint32_t nowMs) {
       buttonStableState = reading;
       if (buttonStableState == LOW) {
         buttonPressedFlag = true;
+        Serial.println("[TRACK] Button press detected");
       }
     }
   }
@@ -398,7 +518,7 @@ void updateTrack(uint32_t nowMs,
       // Finalize session — stop racing, return to READY
       trackState = TRACK_STATE_READY;
       lapActive = false;
-      leftStartRadius = false;
+      cumulativeDistM = 0.0;
       Serial.println("[TRACK] Session finalized by button");
       diagLog("Session finalized by button");
     } else if (trackState == TRACK_STATE_IDLE ||
@@ -423,12 +543,19 @@ void updateTrack(uint32_t nowMs,
     }
   }
 
-  // --- Track the "left start radius" flag ---
-  if (gpsUpdated && gpsValid && !isnan(startLat) && !isnan(startLon)) {
-    double dist = distanceMeters(lat, lon, startLat, startLon);
-    if (dist > TRACK_LEAVE_RADIUS_M) {
-      leftStartRadius = true;
+  // --- Accumulate distance traveled + save previous GPS for crossing checks ---
+  // Save previous position BEFORE updating (crossing checks need prev→current trajectory)
+  double trajPrevLat = prevGpsLat;
+  double trajPrevLon = prevGpsLon;
+  if (gpsUpdated && gpsValid) {
+    if (!isnan(prevGpsLat) && !isnan(prevGpsLon)) {
+      double stepDist = distanceMeters(prevGpsLat, prevGpsLon, lat, lon);
+      if (stepDist < 50.0) {  // reject implausible GPS jumps
+        cumulativeDistM += stepDist;
+      }
     }
+    prevGpsLat = lat;
+    prevGpsLon = lon;
   }
 
   // --- Recording state: log GPS and watch for circuit completion ---
@@ -437,28 +564,50 @@ void updateTrack(uint32_t nowMs,
     if (gpsUpdated && gpsValid) {
       appendTrackLog(epoch, lat, lon, alt_m, spd_kmph, course_deg, hdop, sats);
     }
-    if (gpsUpdated && gpsValid && leftStartRadius &&
-        isCrossingStart(lat, lon, spd_kmph, course_deg)) {
+    if (gpsUpdated && gpsValid && courseValid &&
+        isCircuitComplete(lat, lon, spd_kmph, course_deg)) {
+      // Update heading from current GPS course — reliable at speed.
+      // The initial heading from lockStartPoint was at ~5 km/h and unreliable.
+      startCourseDeg = course_deg;
+      Serial.print("[TRACK] Updated start heading to ");
+      Serial.print(course_deg, 1);
+      Serial.println(" deg (captured at circuit completion speed)");
       finishTrackRecording();
-    }
-    return;
-  }
 
-  // --- Ready state: waiting for first start-line crossing ---
-  if (trackState == TRACK_STATE_READY) {
-    if (gpsUpdated && gpsValid && leftStartRadius &&
-        isCrossingStart(lat, lon, spd_kmph, course_deg)) {
+      // Go straight to RACING — the circuit completion crossing IS the first start.
+      // lapCount=1 so the next crossing records Lap 1 time (no wasted out-lap).
       trackState = TRACK_STATE_RACING;
       lapActive = true;
       lapStartMs = nowMs;
       currentLapMs = 0;
       lastLapMs = 0;
       bestLapMs = 0;
-      lapCount = 0;
-      leftStartRadius = false;
+      lapCount = 1;
+      cumulativeDistM = 0.0;
       trackEventFlags |= TRACK_EVENT_RECOGNIZED | TRACK_EVENT_LAP_START;
-      Serial.println("[TRACK] >>> RACING started — crossed start line");
-      diagLog("READY->RACING crossed start line");
+      Serial.println("[TRACK] >>> RACING started — timing from circuit detection");
+      diagLog("RECORDING->RACING direct start");
+    }
+    return;
+  }
+
+  // --- Ready state: waiting for first start-line crossing ---
+  if (trackState == TRACK_STATE_READY) {
+    if (gpsUpdated && gpsValid) {
+      double crossFrac = 0.0;
+      if (isCrossingStartLine(lat, lon, trajPrevLat, trajPrevLon, spd_kmph, crossFrac)) {
+        trackState = TRACK_STATE_RACING;
+        lapActive = true;
+        lapStartMs = nowMs;
+        currentLapMs = 0;
+        lastLapMs = 0;
+        bestLapMs = 0;
+        lapCount = 0;
+        cumulativeDistM = 0.0;
+        trackEventFlags |= TRACK_EVENT_RECOGNIZED | TRACK_EVENT_LAP_START;
+        Serial.println("[TRACK] >>> RACING started — crossed start line");
+        diagLog("READY->RACING crossed start line");
+      }
     }
   }
 
@@ -467,24 +616,36 @@ void updateTrack(uint32_t nowMs,
     if (lapActive) {
       currentLapMs = nowMs - lapStartMs;
     }
-    if (gpsUpdated && gpsValid && leftStartRadius &&
-        isCrossingStart(lat, lon, spd_kmph, course_deg)) {
-      if (nowMs - lapStartMs >= MIN_LAP_MS) {
-        lastLapMs = nowMs - lapStartMs;
-        lapCount++;
-        if (bestLapMs == 0 || lastLapMs < bestLapMs) {
-          bestLapMs = lastLapMs;
+    if (gpsUpdated && gpsValid) {
+      double crossFrac = 0.0;
+      if (isCrossingStartLine(lat, lon, trajPrevLat, trajPrevLon, spd_kmph, crossFrac)) {
+        if (nowMs - lapStartMs >= MIN_LAP_MS) {
+          uint32_t thisLapMs = nowMs - lapStartMs;
+
+          if (lapCount > 0) {
+            // Completed a full lap (not the out-lap)
+            lastLapMs = thisLapMs;
+            if (bestLapMs == 0 || lastLapMs < bestLapMs) {
+              bestLapMs = lastLapMs;
+            }
+            trackEventFlags |= TRACK_EVENT_LAP_END;
+            char lapBuf[64];
+            snprintf(lapBuf, sizeof(lapBuf), "[TRACK] >>> LAP %lu completed — %lu.%03lus",
+                     static_cast<unsigned long>(lapCount),
+                     static_cast<unsigned long>(lastLapMs / 1000),
+                     static_cast<unsigned long>(lastLapMs % 1000));
+            Serial.println(lapBuf);
+          } else {
+            // Out-lap completed — don't record time, just note it
+            Serial.println("[TRACK] >>> Out-lap completed");
+          }
+
+          lapCount++;
+          lapStartMs = nowMs;
+          currentLapMs = 0;
+          cumulativeDistM = 0.0;
+          trackEventFlags |= TRACK_EVENT_LAP_START;
         }
-        lapStartMs = nowMs;
-        currentLapMs = 0;
-        leftStartRadius = false;
-        trackEventFlags |= TRACK_EVENT_LAP_END | TRACK_EVENT_LAP_START;
-        char lapBuf[64];
-        snprintf(lapBuf, sizeof(lapBuf), "[TRACK] >>> LAP %lu completed — %lu.%03lus",
-                 static_cast<unsigned long>(lapCount),
-                 static_cast<unsigned long>(lastLapMs / 1000),
-                 static_cast<unsigned long>(lastLapMs % 1000));
-        Serial.println(lapBuf);
       }
     }
   }
@@ -530,7 +691,9 @@ void resetTrack() {
   trackState      = TRACK_STATE_IDLE;
   lapActive       = false;
   startPending    = false;
-  leftStartRadius = false;
+  cumulativeDistM = 0.0;
+  prevGpsLat      = NAN;
+  prevGpsLon      = NAN;
   startLat        = NAN;
   startLon        = NAN;
   startAlt        = NAN;

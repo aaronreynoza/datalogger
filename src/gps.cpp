@@ -75,6 +75,7 @@ void configureGps10Hz() {
 }
 
 void initGps() {
+  GNSS.setRxBufferSize(2048);
   GNSS.begin(GNSS_BAUD_DEFAULT, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
   Serial.println("GNSS serial started at 9600, configuring 10 Hz...");
   delay(500);  // Wait for module to be ready
