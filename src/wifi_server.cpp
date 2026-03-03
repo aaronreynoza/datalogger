@@ -1,7 +1,8 @@
 #include "wifi_server.h"
 
 #include <WiFi.h>
-#include <WebServer.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncJson.h>
 #include <ESPmDNS.h>
 #include <SD.h>
 #include <ArduinoJson.h>
@@ -13,8 +14,26 @@
 #include "race_logger.h"
 #include "track.h"
 
-static WebServer server(80);
+static AsyncWebServer server(80);
 static WifiGpsStatus gpsStatus = {false, 0, 99.0f, 0.0f};
+
+// ── Cached storage stats (SD.totalBytes/usedBytes are very slow on SPI) ──
+static uint32_t cachedTotalMB = 0;
+static uint32_t cachedUsedMB = 0;
+static uint32_t cachedFreeMB = 0;
+static uint32_t lastStorageCacheMs = 0;
+static const uint32_t STORAGE_CACHE_TTL_MS = 30000; // refresh every 30s
+
+static void refreshStorageCache() {
+  uint32_t now = millis();
+  if (cachedTotalMB > 0 && (now - lastStorageCacheMs) < STORAGE_CACHE_TTL_MS) return;
+  uint64_t totalBytes = SD.totalBytes();
+  uint64_t usedBytes = SD.usedBytes();
+  cachedTotalMB = (uint32_t)(totalBytes / (1024 * 1024));
+  cachedUsedMB  = (uint32_t)(usedBytes / (1024 * 1024));
+  cachedFreeMB  = (uint32_t)((totalBytes - usedBytes) / (1024 * 1024));
+  lastStorageCacheMs = now;
+}
 
 void updateWifiGpsStatus(bool fix, uint32_t sats, float hdop, float speedKmh) {
   gpsStatus.fix = fix;
@@ -25,25 +44,18 @@ void updateWifiGpsStatus(bool fix, uint32_t sats, float hdop, float speedKmh) {
 
 // ===================== Helpers =====================
 
-static void addCorsHeaders() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-static void sendJson(int code, JsonDocument &doc) {
+static void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
   String output;
   serializeJson(doc, output);
-  addCorsHeaders();
-  server.send(code, "application/json", output);
+  request->send(code, "application/json", output);
 }
 
-static void sendError(int code, const char *error, const char *message) {
+static void sendError(AsyncWebServerRequest *request, int code, const char *error, const char *message) {
   JsonDocument doc;
   doc["error"] = error;
   doc["message"] = message;
   doc["code"] = code;
-  sendJson(code, doc);
+  sendJson(request, code, doc);
 }
 
 static const char *trackStateName(uint8_t state) {
@@ -74,7 +86,7 @@ static int batteryPercentFromVoltage(uint16_t mv) {
 
 // ===================== GET /api/v1/device =====================
 
-static void handleDevice() {
+static void handleDevice(AsyncWebServerRequest *request) {
   const DeviceConfig &cfg = getConfig();
   TrackUiState ts = getTrackUiState();
 
@@ -90,11 +102,10 @@ static void handleDevice() {
   caps.add("sd_card");
 
   JsonObject storage = doc["storage"].to<JsonObject>();
-  uint64_t totalBytes = SD.totalBytes();
-  uint64_t usedBytes = SD.usedBytes();
-  storage["total_mb"] = (uint32_t)(totalBytes / (1024 * 1024));
-  storage["used_mb"] = (uint32_t)(usedBytes / (1024 * 1024));
-  storage["free_mb"] = (uint32_t)((totalBytes - usedBytes) / (1024 * 1024));
+  refreshStorageCache();
+  storage["total_mb"] = cachedTotalMB;
+  storage["used_mb"] = cachedUsedMB;
+  storage["free_mb"] = cachedFreeMB;
 
   JsonObject battery = doc["battery"].to<JsonObject>();
   uint16_t battMv = pmuBattVoltageMv();
@@ -114,19 +125,19 @@ static void handleDevice() {
 
   doc["state"] = trackStateName(ts.trackState);
 
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== GET /api/v1/sessions =====================
 
-static void handleSessions() {
+static void handleSessions(AsyncWebServerRequest *request) {
   JsonDocument doc;
   JsonArray sessions = doc["sessions"].to<JsonArray>();
   int total = 0;
 
   File root = SD.open("/");
   if (!root) {
-    sendError(500, "sd_error", "Failed to open SD root");
+    sendError(request, 500, "sd_error", "Failed to open SD root");
     return;
   }
 
@@ -232,41 +243,32 @@ static void handleSessions() {
   root.close();
 
   doc["total"] = total;
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== GET /api/v1/sessions/{id}/data =====================
 
-static void handleSessionDownload() {
+static void handleSessionDownload(AsyncWebServerRequest *request) {
   // Extract session ID from the URI: /api/v1/sessions/{id}/data
-  String uri = server.uri();
-  // Expected: /api/v1/sessions/race-20260228-0214/data
+  String uri = request->url();
   int sessStart = strlen("/api/v1/sessions/");
   int dataPos = uri.lastIndexOf("/data");
   if (dataPos < 0 || dataPos <= sessStart) {
-    sendError(400, "bad_request", "Invalid session URL");
+    sendError(request, 400, "bad_request", "Invalid session URL");
     return;
   }
   String sessionId = uri.substring(sessStart, dataPos);
   String filename = "/" + sessionId + ".atp";
 
   if (!SD.exists(filename)) {
-    sendError(404, "not_found", "Session not found");
-    return;
-  }
-
-  File f = SD.open(filename, "r");
-  if (!f) {
-    sendError(500, "sd_error", "Failed to open file");
+    sendError(request, 404, "not_found", "Session not found");
     return;
   }
 
   String dispName = sessionId + ".atp";
-  addCorsHeaders();
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + dispName + "\"");
-  server.sendHeader("Content-Length", String(f.size()));
-  server.streamFile(f, "application/octet-stream");
-  f.close();
+  AsyncWebServerResponse *response = request->beginResponse(SD, filename, "application/octet-stream");
+  response->addHeader("Content-Disposition", "attachment; filename=\"" + dispName + "\"");
+  request->send(response);
 }
 
 // ===================== GET /api/v1/sessions/{id} =====================
@@ -302,17 +304,17 @@ static const ChannelInfo CHANNEL_TABLE[] = {
 };
 static constexpr uint16_t NUM_API_CHANNELS = sizeof(CHANNEL_TABLE) / sizeof(CHANNEL_TABLE[0]);
 
-static void handleSessionDetail(const String &sessionId) {
+static void handleSessionDetail(AsyncWebServerRequest *request, const String &sessionId) {
   String filename = "/" + sessionId + ".atp";
 
   if (!SD.exists(filename)) {
-    sendError(404, "not_found", "Session not found");
+    sendError(request, 404, "not_found", "Session not found");
     return;
   }
 
   AtpFileMeta meta;
   if (!atpReadMeta(filename.c_str(), meta)) {
-    sendError(500, "read_error", "Failed to read session metadata");
+    sendError(request, 500, "read_error", "Failed to read session metadata");
     return;
   }
 
@@ -403,12 +405,12 @@ static void handleSessionDetail(const String &sessionId) {
     }
   }
 
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== GET /api/v1/tracks =====================
 
-static void handleGetTracks() {
+static void handleGetTracks(AsyncWebServerRequest *request) {
   JsonDocument doc;
   JsonArray tracks = doc["tracks"].to<JsonArray>();
 
@@ -438,26 +440,16 @@ static void handleGetTracks() {
     }
   }
 
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== POST /api/v1/tracks =====================
 
-static void handlePostTrack() {
-  if (!server.hasArg("plain")) {
-    sendError(400, "bad_request", "Missing JSON body");
-    return;
-  }
-
-  JsonDocument reqDoc;
-  DeserializationError err = deserializeJson(reqDoc, server.arg("plain"));
-  if (err) {
-    sendError(400, "bad_request", "Invalid JSON");
-    return;
-  }
+static void handlePostTrack(AsyncWebServerRequest *request, JsonVariant &json) {
+  JsonObject reqDoc = json.as<JsonObject>();
 
   if (!reqDoc["start_lat"].is<double>() || !reqDoc["start_lon"].is<double>()) {
-    sendError(400, "bad_request", "start_lat and start_lon are required");
+    sendError(request, 400, "bad_request", "start_lat and start_lon are required");
     return;
   }
 
@@ -469,7 +461,7 @@ static void handlePostTrack() {
 
   uint32_t trackId = 0;
   if (!addTrackFromApi(lat, lon, alt, heading, name, trackId)) {
-    sendError(500, "save_failed", "Failed to save track");
+    sendError(request, 500, "save_failed", "Failed to save track");
     return;
   }
 
@@ -480,34 +472,34 @@ static void handlePostTrack() {
   doc["track_id_hex"] = hexBuf;
   doc["name"] = name;
   doc["status"] = "saved";
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== DELETE /api/v1/tracks?id=XXXX =====================
 
-static void handleDeleteTrack() {
-  if (!server.hasArg("id")) {
-    sendError(400, "bad_request", "Missing id parameter");
+static void handleDeleteTrack(AsyncWebServerRequest *request) {
+  if (!request->hasParam("id")) {
+    sendError(request, 400, "bad_request", "Missing id parameter");
     return;
   }
-  uint32_t tid = strtoul(server.arg("id").c_str(), nullptr, 10);
+  uint32_t tid = strtoul(request->getParam("id")->value().c_str(), nullptr, 10);
   if (tid == 0) {
-    sendError(400, "bad_request", "Invalid track id");
+    sendError(request, 400, "bad_request", "Invalid track id");
     return;
   }
   if (!deleteTrack(tid)) {
-    sendError(404, "not_found", "Track not found");
+    sendError(request, 404, "not_found", "Track not found");
     return;
   }
   JsonDocument doc;
   doc["status"] = "deleted";
   doc["track_id"] = tid;
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== GET /api/v1/config =====================
 
-static void handleGetConfig() {
+static void handleGetConfig(AsyncWebServerRequest *request) {
   const DeviceConfig &cfg = getConfig();
   JsonDocument doc;
   doc["driver_name"] = cfg.driverName;
@@ -522,31 +514,21 @@ static void handleGetConfig() {
   } else {
     doc["weather"] = (const char *)nullptr;  // JSON null
   }
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== POST /api/v1/config =====================
 
-static void handleSetConfig() {
+static void handleSetConfig(AsyncWebServerRequest *request, JsonVariant &json) {
   // Reject if currently recording
   TrackUiState ts = getTrackUiState();
   if (ts.trackState == TRACK_STATE_RACING) {
-    sendError(409, "recording_active",
+    sendError(request, 409, "recording_active",
               "Cannot update config while recording. Stop the session first.");
     return;
   }
 
-  if (!server.hasArg("plain")) {
-    sendError(400, "bad_request", "Missing JSON body");
-    return;
-  }
-
-  JsonDocument reqDoc;
-  DeserializationError err = deserializeJson(reqDoc, server.arg("plain"));
-  if (err) {
-    sendError(400, "bad_request", "Invalid JSON");
-    return;
-  }
+  JsonObject reqDoc = json.as<JsonObject>();
 
   // Apply fields (only update what's provided)
   if (reqDoc["driver_name"].is<const char *>()) {
@@ -591,14 +573,13 @@ static void handleSetConfig() {
   } else {
     cfgObj["weather"] = (const char *)nullptr;
   }
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== GET /api/v1/live/status =====================
 
-static void handleLiveStatus() {
+static void handleLiveStatus(AsyncWebServerRequest *request) {
   TrackUiState ts = getTrackUiState();
-  const DeviceConfig &cfg = getConfig();
 
   JsonDocument doc;
   doc["state"] = trackStateName(ts.trackState);
@@ -635,24 +616,22 @@ static void handleLiveStatus() {
   uint16_t battMv = pmuBattVoltageMv();
   doc["battery_percent"] = batteryPercentFromVoltage(battMv);
 
-  uint64_t totalBytes = SD.totalBytes();
-  uint64_t usedBytes = SD.usedBytes();
-  doc["sd_free_mb"] = (uint32_t)((totalBytes - usedBytes) / (1024 * 1024));
+  refreshStorageCache();
+  doc["sd_free_mb"] = cachedFreeMB;
 
-  sendJson(200, doc);
+  sendJson(request, 200, doc);
 }
 
 // ===================== GET /api/v1/debug =====================
 
-static void handleDebug() {
+static void handleDebug(AsyncWebServerRequest *request) {
   String log = readDiagLog();
-  addCorsHeaders();
-  server.send(200, "text/plain", log);
+  request->send(200, "text/plain", log);
 }
 
 // ===================== GET / (legacy root page) =====================
 
-static void handleRoot() {
+static void handleRoot(AsyncWebServerRequest *request) {
   const DeviceConfig &cfg = getConfig();
   TrackUiState ts = getTrackUiState();
 
@@ -707,55 +686,55 @@ static void handleRoot() {
     if (count == 0) html += "<p>No files found.</p>";
   }
   html += "</body></html>";
-  server.send(200, "text/html", html);
+  request->send(200, "text/html", html);
 }
 
 // ===================== Legacy CSV download (for track recordings) =====================
 
-static void handleLogDownload() {
-  if (!server.hasArg("file")) {
-    server.send(400, "text/plain", "Missing ?file=");
+static void handleLogDownload(AsyncWebServerRequest *request) {
+  if (!request->hasParam("file")) {
+    request->send(400, "text/plain", "Missing ?file=");
     return;
   }
-  String fname = server.arg("file");
+  String fname = request->getParam("file")->value();
   if (!fname.startsWith("/")) fname = "/" + fname;
   if (!SD.exists(fname)) {
-    server.send(404, "text/plain", "File not found");
+    request->send(404, "text/plain", "File not found");
     return;
   }
-  File f = SD.open(fname, "r");
   String dispName = fname;
   if (dispName.startsWith("/")) dispName.remove(0, 1);
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + dispName + "\"");
-  server.streamFile(f, "text/csv");
-  f.close();
+  AsyncWebServerResponse *response = request->beginResponse(SD, fname, "text/csv");
+  response->addHeader("Content-Disposition", "attachment; filename=\"" + dispName + "\"");
+  request->send(response);
 }
 
 // ===================== Route not found =====================
 
-static void handleNotFound() {
-  String uri = server.uri();
-  // CORS preflight for dynamic session routes
-  if (uri.startsWith("/api/v1/") && server.method() == HTTP_OPTIONS) {
-    addCorsHeaders();
-    server.send(204);
+static void handleNotFound(AsyncWebServerRequest *request) {
+  String uri = request->url();
+
+  // CORS preflight for any API route
+  if (request->method() == HTTP_OPTIONS) {
+    request->send(204);
     return;
   }
-  if (uri.startsWith("/api/v1/sessions/") && server.method() == HTTP_GET) {
+
+  if (uri.startsWith("/api/v1/sessions/") && request->method() == HTTP_GET) {
     int sessStart = strlen("/api/v1/sessions/");
     // GET /api/v1/sessions/{id}/data — binary download
     if (uri.endsWith("/data")) {
-      handleSessionDownload();
+      handleSessionDownload(request);
       return;
     }
     // GET /api/v1/sessions/{id} — session detail with laps + channels
     String sessionId = uri.substring(sessStart);
     if (sessionId.length() > 0 && sessionId.indexOf('/') < 0) {
-      handleSessionDetail(sessionId);
+      handleSessionDetail(request, sessionId);
       return;
     }
   }
-  sendError(404, "not_found", "Endpoint not found");
+  sendError(request, 404, "not_found", "Endpoint not found");
 }
 
 // ===================== Setup =====================
@@ -797,36 +776,45 @@ void setupWiFi() {
     Serial.println("[mDNS] start FAILED");
   }
 
-  // API v1 endpoints
-  server.on("/api/v1/device",      HTTP_GET,  handleDevice);
-  server.on("/api/v1/sessions",    HTTP_GET,  handleSessions);
-  server.on("/api/v1/tracks",      HTTP_GET,    handleGetTracks);
-  server.on("/api/v1/tracks",      HTTP_POST,   handlePostTrack);
-  server.on("/api/v1/tracks",      HTTP_DELETE, handleDeleteTrack);
-  server.on("/api/v1/config",      HTTP_GET,  handleGetConfig);
-  server.on("/api/v1/config",      HTTP_POST, handleSetConfig);
-  server.on("/api/v1/live/status", HTTP_GET,  handleLiveStatus);
-  server.on("/api/v1/debug",       HTTP_GET,  handleDebug);
+  // Pre-warm storage cache so first request is fast
+  refreshStorageCache();
 
-  // CORS preflight handler for all API routes
-  server.on("/api/v1/device",      HTTP_OPTIONS, []() { addCorsHeaders(); server.send(204); });
-  server.on("/api/v1/sessions",    HTTP_OPTIONS, []() { addCorsHeaders(); server.send(204); });
-  server.on("/api/v1/tracks",      HTTP_OPTIONS, []() { addCorsHeaders(); server.send(204); });
-  server.on("/api/v1/config",      HTTP_OPTIONS, []() { addCorsHeaders(); server.send(204); });
-  server.on("/api/v1/live/status", HTTP_OPTIONS, []() { addCorsHeaders(); server.send(204); });
-  server.on("/api/v1/debug",       HTTP_OPTIONS, []() { addCorsHeaders(); server.send(204); });
+  // CORS headers on all responses
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // API v1 GET endpoints
+  server.on("/api/v1/device",      HTTP_GET, handleDevice);
+  server.on("/api/v1/sessions",    HTTP_GET, handleSessions);
+  server.on("/api/v1/tracks",      HTTP_GET, handleGetTracks);
+  server.on("/api/v1/config",      HTTP_GET, handleGetConfig);
+  server.on("/api/v1/live/status", HTTP_GET, handleLiveStatus);
+  server.on("/api/v1/debug",       HTTP_GET, handleDebug);
+
+  // API v1 DELETE endpoint
+  server.on("/api/v1/tracks", HTTP_DELETE, handleDeleteTrack);
+
+  // API v1 POST endpoints (JSON body via AsyncCallbackJsonWebHandler)
+  AsyncCallbackJsonWebHandler *trackPostHandler = new AsyncCallbackJsonWebHandler(
+      "/api/v1/tracks",
+      [](AsyncWebServerRequest *request, JsonVariant &json) { handlePostTrack(request, json); }
+  );
+  server.addHandler(trackPostHandler);
+
+  AsyncCallbackJsonWebHandler *configPostHandler = new AsyncCallbackJsonWebHandler(
+      "/api/v1/config",
+      [](AsyncWebServerRequest *request, JsonVariant &json) { handleSetConfig(request, json); }
+  );
+  server.addHandler(configPostHandler);
 
   // Legacy endpoints
-  server.on("/", handleRoot);
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/log", HTTP_GET, handleLogDownload);
 
   // Catch-all for dynamic session routes + OPTIONS preflight
   server.onNotFound(handleNotFound);
 
   server.begin();
-  Serial.println("[WiFi] HTTP server started on port 80");
-}
-
-void handleServer() {
-  server.handleClient();
+  Serial.println("[WiFi] Async HTTP server started on port 80");
 }

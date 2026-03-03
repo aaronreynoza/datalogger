@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-void initPmu();
+bool initPmu();
 bool isPmuReady();
 uint16_t pmuBattVoltageMv();
 uint16_t pmuVbusVoltageMv();

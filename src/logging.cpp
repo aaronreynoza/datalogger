@@ -1,127 +1,87 @@
 #include "logging.h"
 
-#include "imu.h"
+#include <SD.h>
+#include <SPI.h>
+#include <cstring>
 
-static const char *LOG_GPS_PREFIX = "/gps_";
-static const char *LOG_IMU_PREFIX = "/imu_";
-static const char *LOG_STATUS_PREFIX = "/status_";
-static const char *LOG_EXT        = ".csv";
+#include "imu.h"  // for sharedHSPI()
+
+static constexpr int SD_CS_PIN = 47;
+
+static const char *TRACKS_FILE = "/tracks.csv";
 
 bool storageReady = false;
 bool loggingEnabled = false;
-String gpsLogPath;
-String imuLogPath;
-String statusLogPath;
+String trackLogPath;
 
-static int sessionId = 1;
+static File trackFile;
+static bool trackLogOpen = false;
 
-static String makeLogPath(int id) {
+static String makeTrackLogPath(uint32_t trackId) {
   char buf[32];
-  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_GPS_PREFIX, id, LOG_EXT);
+  snprintf(buf, sizeof(buf), "/track_%08lX.csv", static_cast<unsigned long>(trackId));
   return String(buf);
-}
-
-static String makeImuLogPath(int id) {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_IMU_PREFIX, id, LOG_EXT);
-  return String(buf);
-}
-
-static String makeStatusLogPath(int id) {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%s%03d%s", LOG_STATUS_PREFIX, id, LOG_EXT);
-  return String(buf);
-}
-
-static bool createNewLogFile(const String &path, const char *header) {
-  File f = LittleFS.open(path, "w");
-  if (!f) return false;
-
-  f.println(header);
-  f.close();
-  Serial.print("Created log file: ");
-  Serial.println(path);
-  return true;
 }
 
 bool initStorage() {
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS mount failed");
+  Serial.print("[SD] CS=");
+  Serial.print(SD_CS_PIN);
+  Serial.println(" — attempting mount...");
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  delay(50);
+  if (!SD.begin(SD_CS_PIN, sharedHSPI())) {
+    Serial.println("[SD] mount FAILED — check card is FAT32 and seated properly");
+    storageReady = false;
+    loggingEnabled = false;
     return false;
   }
-  Serial.println("LittleFS mounted OK");
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.print("[SD] mounted OK — ");
+  Serial.print((uint32_t)cardSize);
+  Serial.println(" MB");
+  storageReady = true;
+  loggingEnabled = true;
   return true;
 }
 
-bool createSessionLogs() {
-  int newId = sessionId++;
-  gpsLogPath = makeLogPath(newId);
-  imuLogPath = makeImuLogPath(newId);
-  statusLogPath = makeStatusLogPath(newId);
-
-  static const char *gpsHeader =
-    "epoch_s,ms_since_boot,lat,lon,alt_m,spd_kmph,hdop,sats";
-  static const char *imuHeader =
-    "epoch_s,ms_since_boot,ax_mps2,ay_mps2,az_mps2,"
-    "gx_dps,gy_dps,gz_dps,imu_temp_C";
-  static const char *statusHeader =
-    "ms_since_boot,gps_ok,imu_ok,lora_ok,storage_ok";
-
-#if defined(LOG_STATUS_ONLY)
-  if (!createNewLogFile(statusLogPath, statusHeader)) {
-    statusLogPath = "";
+bool startTrackLog(uint32_t trackId) {
+  if (!storageReady || !loggingEnabled) return false;
+  if (trackLogOpen) {
+    trackFile.close();
+    trackLogOpen = false;
+  }
+  trackLogPath = makeTrackLogPath(trackId);
+  trackFile = SD.open(trackLogPath, "w");
+  if (!trackFile) {
+    trackLogPath = "";
     return false;
   }
-  gpsLogPath = "";
-  imuLogPath = "";
+  trackFile.println("epoch_s,ms_since_boot,lat,lon,alt_m,spd_kmph,course_deg,hdop,sats");
+  trackFile.flush();
+  trackLogOpen = true;
   return true;
-#else
-  if (!createNewLogFile(gpsLogPath, gpsHeader) ||
-      !createNewLogFile(imuLogPath, imuHeader)) {
-    gpsLogPath = "";
-    imuLogPath = "";
-    return false;
-  }
-  statusLogPath = "";
-  return true;
-#endif
 }
 
-void stopLogging() {
-  loggingEnabled = false;
+void stopTrackLog() {
+  if (trackLogOpen) {
+    trackFile.close();
+    trackLogOpen = false;
+  }
 }
 
-void appendGpsLog(uint32_t epoch,
-                  double lat, double lon,
-                  double alt_m, double spd_kmph,
-                  double hdop, uint32_t sats) {
-#if defined(LOG_STATUS_ONLY)
-  (void)epoch;
-  (void)lat;
-  (void)lon;
-  (void)alt_m;
-  (void)spd_kmph;
-  (void)hdop;
-  (void)sats;
-  return;
-#endif
-  if (!storageReady || !loggingEnabled || gpsLogPath.isEmpty()) return;
-
-  File f = LittleFS.open(gpsLogPath, "a");
-  if (!f) {
-    Serial.println("Failed to open GPS log file for append");
-    return;
-  }
+void appendTrackLog(uint32_t epoch,
+                    double lat, double lon, double alt_m,
+                    double spd_kmph, double course_deg,
+                    double hdop, uint32_t sats) {
+  if (!storageReady || !loggingEnabled || !trackLogOpen) return;
 
   String line;
   line.reserve(120);
-
   if (epoch) line += String(epoch);
   line += ",";
-
   line += String(millis());
   line += ",";
-
   if (!isnan(lat)) line += String(lat, 6);
   line += ",";
   if (!isnan(lon)) line += String(lon, 6);
@@ -130,85 +90,17 @@ void appendGpsLog(uint32_t epoch,
   line += ",";
   if (!isnan(spd_kmph)) line += String(spd_kmph, 2);
   line += ",";
+  if (!isnan(course_deg)) line += String(course_deg, 2);
+  line += ",";
   if (!isnan(hdop)) line += String(hdop, 2);
   line += ",";
   if (sats) line += String(sats);
-  line += ",";
-
-  f.println(line);
-  f.close();
-}
-
-void appendImuLog(uint32_t epoch) {
-#if defined(LOG_STATUS_ONLY)
-  (void)epoch;
-  return;
-#endif
-  if (!storageReady || !loggingEnabled || imuLogPath.isEmpty()) return;
-
-  File f = LittleFS.open(imuLogPath, "a");
-  if (!f) {
-    Serial.println("Failed to open IMU log file for append");
-    return;
-  }
-
-  String line;
-  line.reserve(120);
-
-  if (epoch) line += String(epoch);
-  line += ",";
-  line += String(millis());
-  line += ",";
-
-  if (imuData.hasData) {
-    line += String(imuData.acc.x, 3); line += ",";
-    line += String(imuData.acc.y, 3); line += ",";
-    line += String(imuData.acc.z, 3); line += ",";
-    line += String(imuData.gyr.x, 3); line += ",";
-    line += String(imuData.gyr.y, 3); line += ",";
-    line += String(imuData.gyr.z, 3); line += ",";
-  } else {
-    line += ",,,,,,";
-  }
-
-  if (!isnan(imuData.tempC)) line += String(imuData.tempC, 2);
-  f.println(line);
-  f.close();
-}
-
-void appendStatusLog(bool gpsOk, bool imuOk, bool loraOk, bool storageOk) {
-#if !defined(LOG_STATUS_ONLY)
-  (void)gpsOk;
-  (void)imuOk;
-  (void)loraOk;
-  (void)storageOk;
-  return;
-#endif
-  if (!storageReady || !loggingEnabled || statusLogPath.isEmpty()) return;
-
-  File f = LittleFS.open(statusLogPath, "a");
-  if (!f) {
-    Serial.println("Failed to open status log file for append");
-    return;
-  }
-
-  String line;
-  line.reserve(64);
-  line += String(millis());
-  line += ",";
-  line += (gpsOk ? "1" : "0");
-  line += ",";
-  line += (imuOk ? "1" : "0");
-  line += ",";
-  line += (loraOk ? "1" : "0");
-  line += ",";
-  line += (storageOk ? "1" : "0");
-  f.println(line);
-  f.close();
+  trackFile.println(line);
+  trackFile.flush();
 }
 
 void dumpFile(const String &path) {
-  File f = LittleFS.open(path, "r");
+  File f = SD.open(path, "r");
   if (!f) {
     Serial.println("No log file");
     return;
@@ -222,29 +114,92 @@ void dumpFile(const String &path) {
 }
 
 void clearLogs() {
-  File root = LittleFS.open("/");
+  if (trackLogOpen) {
+    trackFile.close();
+    trackLogOpen = false;
+  }
+
+  // Remove race logs (.atp), track recording logs, but NOT tracks.csv or config.json
+  File root = SD.open("/");
   if (!root) return;
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if (name.startsWith(LOG_GPS_PREFIX) ||
-        name.startsWith(LOG_IMU_PREFIX) ||
-        name.startsWith(LOG_STATUS_PREFIX)) {
+    if (name.startsWith("/track_") || name.startsWith("/race-") ||
+        name.endsWith(".atp")) {
       Serial.print("Removing "); Serial.println(name);
-      LittleFS.remove(name);
+      SD.remove(name);
     }
     file = root.openNextFile();
   }
   root.close();
-  gpsLogPath = "";
-  imuLogPath = "";
-  statusLogPath = "";
-  loggingEnabled = false;
-  sessionId = 1;
+  trackLogPath = "";
+}
+
+// ===================== Persistent diagnostic log =====================
+
+static const char *DIAG_LOG_FILE = "/diag.log";
+static constexpr size_t DIAG_MAX_SIZE = 8192;  // 8 KB max, truncate old entries
+
+void diagLog(const char *msg) {
+  if (!storageReady) return;
+
+  // Truncate if too large (keep last half)
+  File check = SD.open(DIAG_LOG_FILE, "r");
+  if (check) {
+    size_t sz = check.size();
+    check.close();
+    if (sz > DIAG_MAX_SIZE) {
+      // Read last half, rewrite
+      File r = SD.open(DIAG_LOG_FILE, "r");
+      r.seek(sz - DIAG_MAX_SIZE / 2);
+      String keep;
+      keep.reserve(DIAG_MAX_SIZE / 2 + 64);
+      keep = "--- truncated ---\n";
+      while (r.available()) {
+        keep += (char)r.read();
+      }
+      r.close();
+      File w = SD.open(DIAG_LOG_FILE, "w");
+      if (w) { w.print(keep); w.close(); }
+    }
+  }
+
+  File f = SD.open(DIAG_LOG_FILE, "a");
+  if (!f) return;
+
+  // Write boot-relative timestamp
+  uint32_t sec = millis() / 1000;
+  char timeBuf[16];
+  snprintf(timeBuf, sizeof(timeBuf), "[%lu.%lus] ",
+           (unsigned long)(sec / 60), (unsigned long)(sec % 60));
+  f.print(timeBuf);
+  f.println(msg);
+  f.close();
+}
+
+void diagLogf(const char *fmt, ...) {
+  char buf[128];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  diagLog(buf);
+}
+
+String readDiagLog() {
+  if (!storageReady) return "SD not ready";
+  File f = SD.open(DIAG_LOG_FILE, "r");
+  if (!f) return "No diagnostic log";
+  String content;
+  content.reserve(f.size() + 1);
+  while (f.available()) content += (char)f.read();
+  f.close();
+  return content;
 }
 
 void listLogsTo(Print &out) {
-  File root = LittleFS.open("/");
+  File root = SD.open("/");
   if (!root) {
     out.println("Failed to open root");
     return;
@@ -252,11 +207,11 @@ void listLogsTo(Print &out) {
   File file = root.openNextFile();
   while (file) {
     String name = file.name();
-    if ((name.startsWith(LOG_GPS_PREFIX) ||
-         name.startsWith(LOG_IMU_PREFIX) ||
-         name.startsWith(LOG_STATUS_PREFIX)) &&
-        name.endsWith(LOG_EXT)) {
-      if (name.startsWith("/")) name.remove(0,1);
+    if (name.startsWith("/track_") ||
+        name.startsWith("/race-") ||
+        name.endsWith(".atp") ||
+        name == TRACKS_FILE) {
+      if (name.startsWith("/")) name.remove(0, 1);
       out.println(name);
     }
     file = root.openNextFile();

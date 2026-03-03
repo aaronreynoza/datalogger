@@ -2,30 +2,40 @@
 
 #include <SPI.h>
 
-// Pins from Meshtastic T-Beam S3 Supreme docs
-static const int IMU_MOSI_PIN = 35;
-static const int IMU_MISO_PIN = 37;
-static const int IMU_SCK_PIN  = 36;
-static const int IMU_CS_PIN   = 34;
+// HSPI pins shared by IMU and SD card
+static const int HSPI_SCK_PIN  = 36;
+static const int HSPI_MISO_PIN = 37;
+static const int HSPI_MOSI_PIN = 35;
+static const int IMU_CS_PIN    = 34;
 
-static SPIClass imuSPI(HSPI);
+static SPIClass hspi(HSPI);
+static bool hspiStarted = false;
+
+SPIClass &sharedHSPI() {
+  if (!hspiStarted) {
+    hspi.begin(HSPI_SCK_PIN, HSPI_MISO_PIN, HSPI_MOSI_PIN);
+    hspiStarted = true;
+  }
+  return hspi;
+}
+
 static SensorQMI8658 qmi;
+static bool imuReady = false;
 
 ImuData imuData;
 
-void initImu() {
-  Serial.println("Init QMI8658 over SPI (SensorLib 0.3.x API)");
+bool initImu() {
+  Serial.println("[IMU] Initializing QMI8658 over SPI");
 
-  imuSPI.begin(IMU_SCK_PIN, IMU_MISO_PIN, IMU_MOSI_PIN, IMU_CS_PIN);
   pinMode(IMU_CS_PIN, OUTPUT);
   digitalWrite(IMU_CS_PIN, HIGH);
 
-  if (!qmi.begin(imuSPI, IMU_CS_PIN)) {
-    Serial.println("QMI8658 init FAILED");
-    return;
+  if (!qmi.begin(sharedHSPI(), IMU_CS_PIN)) {
+    Serial.println("[IMU] QMI8658 init FAILED");
+    return false;
   }
 
-  Serial.print("QMI8658 ID: 0x");
+  Serial.print("[IMU] QMI8658 ID: 0x");
   Serial.println(qmi.getChipID(), HEX);
 
   qmi.configAccelerometer(
@@ -41,7 +51,13 @@ void initImu() {
   qmi.enableAccelerometer();
   qmi.enableGyroscope();
 
-  Serial.println("QMI8658 configured");
+  imuReady = true;
+  Serial.println("[IMU] QMI8658 configured");
+  return true;
+}
+
+bool isImuReady() {
+  return imuReady;
 }
 
 void updateImu() {

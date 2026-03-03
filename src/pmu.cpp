@@ -11,13 +11,13 @@ static TwoWire pmuWire(1);
 static XPowersAXP2101 pmu;
 static bool pmuReady = false;
 
-void initPmu() {
+bool initPmu() {
   Serial.println("[PMU] Initializing AXP2101");
 
   if (!pmu.begin(pmuWire, PMU_ADDR, PMU_SDA, PMU_SCL)) {
     Serial.println("[PMU] AXP2101 not found");
     pmuReady = false;
-    return;
+    return false;
   }
 
   Serial.println("[PMU] AXP2101 connected");
@@ -44,6 +44,7 @@ void initPmu() {
   pmu.enableBattVoltageMeasure();
   pmu.enableVbusVoltageMeasure();
   pmu.enableSystemVoltageMeasure();
+  return true;
 }
 
 bool isPmuReady() {
