@@ -576,6 +576,7 @@ static void handlePostTrack(AsyncWebServerRequest *request, JsonVariant &json) {
 // ===================== DELETE /api/v1/tracks?id=XXXX =====================
 
 static void handleDeleteTrack(AsyncWebServerRequest *request) {
+  SdBusyGuard guard;
   if (!request->hasParam("id")) {
     sendError(request, 400, "bad_request", "Missing id parameter");
     return;
@@ -593,6 +594,33 @@ static void handleDeleteTrack(AsyncWebServerRequest *request) {
   doc["status"] = "deleted";
   doc["track_id"] = tid;
   sendJson(request, 200, doc);
+  cachedTotalMB = 0; // Invalidate storage cache
+}
+
+// ===================== DELETE /api/v1/sessions/{id} =====================
+
+static void handleDeleteSession(AsyncWebServerRequest *request, const String &sessionId) {
+  SdBusyGuard guard;
+
+  // Build file path: /race-YYYYMMDD-HHMM.atp (session ID is filename without extension)
+  String path = "/" + sessionId + ".atp";
+  if (!SD.exists(path)) {
+    sendError(request, 404, "not_found", "Session not found");
+    return;
+  }
+  if (!SD.remove(path)) {
+    sendError(request, 500, "delete_failed", "Failed to delete session file");
+    return;
+  }
+
+  JsonDocument doc;
+  doc["status"] = "deleted";
+  doc["session_id"] = sessionId;
+  sendJson(request, 200, doc);
+  cachedTotalMB = 0; // Invalidate storage cache
+
+  Serial.print("[API] Deleted session: ");
+  Serial.println(sessionId);
 }
 
 // ===================== GET /api/v1/config =====================
@@ -914,6 +942,17 @@ static void handleNotFound(AsyncWebServerRequest *request) {
       return;
     }
   }
+
+  // DELETE /api/v1/sessions/{id}
+  if (uri.startsWith("/api/v1/sessions/") && request->method() == HTTP_DELETE) {
+    int sessStart = strlen("/api/v1/sessions/");
+    String sessionId = uri.substring(sessStart);
+    if (sessionId.length() > 0 && sessionId.indexOf('/') < 0) {
+      handleDeleteSession(request, sessionId);
+      return;
+    }
+  }
+
   sendError(request, 404, "not_found", "Endpoint not found");
 }
 
