@@ -52,3 +52,4 @@ void pushImuSample(const ImuSample &sample);
 void onGpsFix(const GpsFix &fix);
 void flushRaceLogger(uint32_t nowMs);
 const char *getRaceSessionFilename();
+void getRaceGpsStats(uint32_t &received, uint32_t &written);

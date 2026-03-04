@@ -7,8 +7,8 @@
 #include "logging.h"
 #include "track.h"
 
-static constexpr uint32_t MAX_INTERP_MS = 200;
-static constexpr uint32_t REAL_FIX_WINDOW_MS = 10;
+static constexpr uint32_t MAX_INTERP_MS = 1500;       // handles 1 Hz GPS fallback
+static constexpr uint32_t REAL_FIX_WINDOW_MS = 100;    // wider window for real-fix tag
 static constexpr size_t IMU_BUFFER_SIZE = 600;
 static constexpr double EARTH_RADIUS_M = 6371000.0;
 
@@ -40,6 +40,10 @@ static float lapDistanceM = 0.0f;
 
 static AtpSession atpSession;
 static uint8_t lastTrackState = TRACK_STATE_IDLE;
+
+// Diagnostic counters (printed on serial, reset each session)
+static uint32_t gpsFixesReceived = 0;
+static uint32_t gpsFixesWritten = 0;
 
 static double deg2rad(double deg) {
   return deg * (PI / 180.0);
@@ -225,6 +229,8 @@ bool startRaceLogger(uint32_t epoch, uint32_t nowMs,
   lastPosValid = false;
   lapDistanceM = 0.0f;
   lastTrackState = TRACK_STATE_IDLE;
+  gpsFixesReceived = 0;
+  gpsFixesWritten = 0;
   return true;
 }
 
@@ -234,6 +240,13 @@ bool isRaceLoggerActive() {
 
 void stopRaceLogger() {
   if (raceActive) {
+    Serial.print("[RACE] GPS stats: ");
+    Serial.print(gpsFixesWritten);
+    Serial.print(" written / ");
+    Serial.print(gpsFixesReceived);
+    Serial.println(" received");
+    diagLogf("GPS stats: %lu written / %lu received",
+             (unsigned long)gpsFixesWritten, (unsigned long)gpsFixesReceived);
     atpClose(atpSession);
   }
   raceActive = false;
@@ -244,6 +257,11 @@ const char *getRaceSessionFilename() {
   return atpSession.filename;
 }
 
+void getRaceGpsStats(uint32_t &received, uint32_t &written) {
+  received = gpsFixesReceived;
+  written = gpsFixesWritten;
+}
+
 void pushImuSample(const ImuSample &sample) {
   if (!raceActive) return;
   pushSample(sample);
@@ -252,6 +270,8 @@ void pushImuSample(const ImuSample &sample) {
 void onGpsFix(const GpsFix &fixIn) {
   if (!raceActive) return;
   if (!refFrame.valid) return;
+
+  gpsFixesReceived++;
 
   GpsFix fix = fixIn;
   if (fix.valid) {
@@ -268,11 +288,25 @@ void onGpsFix(const GpsFix &fixIn) {
   if (!havePrevFix) {
     prevFix = fix;
     havePrevFix = true;
+    // Write seed GPS record — without this the first fix is wasted
+    if (fix.valid && !isnan(fix.lat) && !isnan(fix.lon)) {
+      float speed_mps = isnan(fix.spd_kmh) ? 0.0f : (float)(fix.spd_kmh / 3.6);
+      float course_f = isnan(fix.course_deg) ? 0.0f : (float)fix.course_deg;
+      float hdop_f = isnan(fix.hdop) ? 99.0f : (float)fix.hdop;
+      atpPushGps(atpSession, fix.ms,
+                 fix.lat, fix.lon, (float)fix.alt_m,
+                 speed_mps, course_f,
+                 hdop_f, (uint8_t)fix.sats,
+                 (float)fix.x_m, (float)fix.y_m, (float)fix.z_m,
+                 (float)fix.vn_mps, (float)fix.ve_mps, lapDistanceM);
+      gpsFixesWritten++;
+    }
     return;
   }
 
   uint32_t dtMs = fix.ms - prevFix.ms;
   bool interpOk = dtMs > 0 && dtMs <= MAX_INTERP_MS && prevFix.good && fix.good;
+  bool wroteGpsThisFix = false;
 
   ImuSample sample;
   while (peekSample(sample)) {
@@ -343,6 +377,8 @@ void onGpsFix(const GpsFix &fixIn) {
       }
     }
 
+    if (gpsSource > 0) wroteGpsThisFix = true;
+
     if (fix.degraded && gpsSource == 2) {
       eventFlags |= RACE_EVENT_GPS_DEGRADED;
     }
@@ -355,24 +391,51 @@ void onGpsFix(const GpsFix &fixIn) {
                  gpsSource, eventFlags);
   }
 
+  // Guarantee at least 1 GPS record per valid fix.  If the drain loop
+  // didn't tag any sample (timing edge cases, empty buffer, etc.), write
+  // a standalone GPS record so the ATP file always has position data.
+  if (!wroteGpsThisFix && fix.valid && !isnan(fix.lat) && !isnan(fix.lon)) {
+    float speed_mps = isnan(fix.spd_kmh) ? 0.0f : (float)(fix.spd_kmh / 3.6);
+    float course_f = isnan(fix.course_deg) ? 0.0f : (float)fix.course_deg;
+    float hdop_f = isnan(fix.hdop) ? 99.0f : (float)fix.hdop;
+    atpPushGps(atpSession, fix.ms,
+               fix.lat, fix.lon, (float)fix.alt_m,
+               speed_mps, course_f,
+               hdop_f, (uint8_t)fix.sats,
+               (float)fix.x_m, (float)fix.y_m, (float)fix.z_m,
+               (float)fix.vn_mps, (float)fix.ve_mps, lapDistanceM);
+    wroteGpsThisFix = true;
+  }
+
+  if (wroteGpsThisFix) gpsFixesWritten++;
+
   prevFix = fix;
   havePrevFix = true;
 }
 
 void flushRaceLogger(uint32_t nowMs) {
-  if (!raceActive || !havePrevFix) return;
+  if (!raceActive) return;
 
-  uint32_t cutoffMs = prevFix.ms + MAX_INTERP_MS;
-  ImuSample sample;
-  while (peekSample(sample)) {
-    if (sample.ms > cutoffMs) break;
-    popSample(sample);
+  // Only drain stale samples when GPS has been absent for >500ms.
+  // At 10 Hz GPS, fixes arrive every ~100ms, so this never triggers during
+  // normal operation.  Samples stay in the ring buffer for onGpsFix() to
+  // process with proper GPS tagging.
+  //
+  // NOTE: prevFix.ms must be based on millis() (not millis() - age()) for
+  // this threshold to work.  See main.cpp updateLatestGps() comment.
+  if (havePrevFix && nowMs > prevFix.ms + 500) {
+    uint32_t cutoffMs = nowMs - 200;  // drain samples >200ms old
+    ImuSample sample;
+    while (peekSample(sample)) {
+      if (sample.ms > cutoffMs) break;
+      popSample(sample);
 
-    uint16_t eventFlags = sample.eventFlags | RACE_EVENT_GPS_GAP;
-    writeRaceRow(sample,
-                 NAN, NAN, NAN, NAN, NAN, NAN, 0,
-                 NAN, NAN, NAN, NAN, NAN,
-                 0, eventFlags);
+      uint16_t eventFlags = sample.eventFlags | RACE_EVENT_GPS_GAP;
+      writeRaceRow(sample,
+                   NAN, NAN, NAN, NAN, NAN, NAN, 0,
+                   NAN, NAN, NAN, NAN, NAN,
+                   0, eventFlags);
+    }
   }
 
   atpFlushChunk(atpSession, false);

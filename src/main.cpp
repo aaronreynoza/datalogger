@@ -65,7 +65,11 @@ static void updateLatestGps(uint32_t nowMs) {
   latestGps.epoch      = gpsUnixTime();
 
   latestGps.ageMs   = gps.location.age();
-  latestGps.fixMs   = nowMs - latestGps.ageMs;
+  // Use nowMs directly — NOT nowMs - ageMs.  When the UART buffer backs
+  // up (normal at 10 Hz / 38400 baud), age() can exceed 500 ms, making
+  // fixMs go backwards and triggering the stale-drain bug in the race
+  // logger (samples drained with gpsSource=0 before onGpsFix sees them).
+  latestGps.fixMs   = nowMs;
   latestGps.updated = true;
 }
 
@@ -140,14 +144,28 @@ static void printTelemetry() {
   Serial.print(String(battMv / 1000) + "." + String((battMv % 1000) / 10) + "V");
 
   Serial.print(" | LOG:");
-  Serial.println(loggingEnabled ? "ON" : "OFF");
+  Serial.print(loggingEnabled ? "ON" : "OFF");
+
+  if (isRaceLoggerActive()) {
+    uint32_t gpsRecv, gpsWrit;
+    getRaceGpsStats(gpsRecv, gpsWrit);
+    Serial.print(" | RACE gps=");
+    Serial.print(gpsWrit);
+    Serial.print("/");
+    Serial.print(gpsRecv);
+  }
+  Serial.println();
 }
 
 // ===================== Setup =====================
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {}
+  // Wait up to 2 s for USB CDC serial — allows boot messages when a monitor
+  // is connected, but doesn't block forever when running standalone.
+  for (uint32_t t0 = millis(); !Serial && millis() - t0 < 2000; ) {
+    delay(10);
+  }
 
   Serial.println();
   Serial.println("==== ApexDirector Core Pro ====");
