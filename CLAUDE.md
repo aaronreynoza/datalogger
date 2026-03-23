@@ -15,6 +15,7 @@ ESP32-S3 race datalogger targeting the **LilyGo T-Beam Supreme** board. Comparab
 | SD Card | — | SPI (HSPI) | CS=47 (shared bus with IMU) |
 | PMU | AXP2101 | I2C (0x34) | SDA=42, SCL=41 |
 | Button | Track control | GPIO 0 | Pull-up, debounced |
+| CAN Transceiver | SN65HVD230 | TWAI (GPIO) | TX=2, RX=3 |
 
 **Removed:** LoRa (SX1262) — antenna reserved for future receiver use.
 
@@ -29,7 +30,7 @@ main.cpp  — orchestrates all modules, runs the main loop
 ├── logging.cpp/h     — SD card file management, buffered writes, diagnostic log
 ├── display.cpp/h     — SH1106 OLED multi-screen UI (U8g2)
 ├── pmu.cpp/h         — AXP2101 power rail control and battery telemetry
-├── can_bus.cpp/h     — CAN bus module stub (ready for MCP2515/ESP32-C3)
+├── can_bus.cpp/h     — CAN bus via ESP32-S3 TWAI (IO2/IO3), Core 0 task, raw logging, OBD2
 ├── device_config.cpp/h — Device serial number and configuration
 └── wifi_server.cpp/h — WiFi AP + HTTP REST API (auto-disabled during recording/racing)
 ```
@@ -45,6 +46,11 @@ main.cpp  — orchestrates all modules, runs the main loop
 - **Housekeeping:** 1000 ms (WiFi management)
 - **Watchdog:** 5 s (reboot on hang)
 - **Race log flush:** 500 ms or 512 B buffer full
+- **CAN receive:** Core 0 task, 10 ms poll (TWAI driver)
+- **CAN log flush:** 500 ms
+- **CAN speed detect:** 3 s per speed (500 → 250 kbps)
+- **OBD2 polling:** 100 ms per PID (10 Hz round-robin)
+- **OBD2 fallback:** 6 s after boot if no passive frames
 
 ## Track & Lap Logic (track.cpp)
 
@@ -74,6 +80,7 @@ State machine: `IDLE → RECORDING → READY → RACING`
 | `track_XXXXXXXX.csv` | GPS snapshots during track recording (10 Hz) |
 | `race-YYYYMMDD-HHMM.atp` | Binary race telemetry (ATP format) |
 | `tracks.csv` | Saved track metadata (start points) |
+| `can-raw-YYYYMMDD-HHMM.bin` | Raw CAN frames binary log (17B/frame) |
 
 ## Build & Flash
 
@@ -107,9 +114,19 @@ pio device monitor -b 115200          # Serial monitor
 - `ArduinoJson` — REST API responses
 - `ESPAsyncWebServer` — Non-blocking HTTP server
 
+## Serial Commands
+
+`Commands: D=toggle log, d=dump, c=clear, l=list, K=OBD2 mode`
+
+- **D** — Toggle diagnostic logging on/off
+- **d** — Dump current log file contents
+- **c** — Clear log file
+- **l** — List files on SD card
+- **K** — Switch CAN bus to OBD2 polling mode (fallback for vehicles with no passive CAN traffic)
+
 ## WiFi Access
 
-- SSID: `tbeam-telemetry` / Password: `tbeam123`
+- SSID: `ApexDirector-{SERIAL}` (e.g., `ApexDirector-CP00001`) / Password: `apex1234`
 - **Auto-disabled during RECORDING/RACING** (SD bus contention)
 - `GET /api/v1/status` — device status JSON
 - `GET /api/v1/tracks` — saved tracks list
@@ -122,7 +139,9 @@ pio device monitor -b 115200          # Serial monitor
 - **SD + IMU share HSPI bus** — WiFi handlers must never touch SD during recording
 - **UART buffer = 2048 bytes** — 10Hz GPS at 38400 baud fills fast, poll frequently
 - **WiFi API cannot be reached from dev machine** — device is AP, connecting loses internet
-- **Serial port:** `/dev/cu.usbmodem2101`
+- **Serial port:** platform-specific (e.g., `/dev/cu.usbmodem2101` on macOS, `/dev/ttyACM0` on Linux, `COMx` on Windows)
+- **CAN bus runs on Core 0** — independent of Core 1 main loop, uses TWAI driver
+- **CAN ring buffer:** 512 frames SPSC lock-free, Core 0 produces, Core 1 consumes
 
 ## Future Work
 
@@ -130,6 +149,9 @@ pio device monitor -b 115200          # Serial monitor
 - [ ] Line-segment crossing time interpolation (sub-GPS-interval accuracy)
 - [ ] Predictive lap timing (delta to best lap)
 - [ ] Sector timing
-- [ ] CAN bus integration (quickshifter, ECU)
+- [x] CAN bus passive sniffing + OBD2 PID fallback (raw log to SD)
+- [ ] CAN signal decoding (binary config from desktop, DBC import)
+- [ ] CAN data in ATP format (REC_CAN_FRAME = 0x05 records)
+- [ ] CAN vehicle profile management (desktop app → device via WiFi)
 - [ ] GPS PPS-disciplined IMU timestamps
-- [ ] LoRa receiver / pit display
+- [ ] Receiver / pit display (antenna reserved for future use)

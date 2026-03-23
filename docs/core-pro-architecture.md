@@ -1,6 +1,6 @@
-# Core Pro — Architecture & Design Discussions
+# core module — Architecture & Design Discussions
 
-**Device:** ApexDirector Core Pro (LilyGo T-Beam Supreme)
+**Device:** ApexDirector core module (LilyGo T-Beam Supreme)
 **Last updated:** February 2026
 
 ---
@@ -19,7 +19,7 @@
 
 ## 1. Hardware Overview
 
-The Core Pro is built on the **LilyGo T-Beam Supreme** development board.
+The core module is built on the **LilyGo T-Beam Supreme** development board.
 
 | Component | Detail |
 |-----------|--------|
@@ -43,7 +43,7 @@ The Core Pro is built on the **LilyGo T-Beam Supreme** development board.
 
 ### Future Sensor Expansion
 
-The Core Pro will support additional sensors via CAN bus, analog inputs, and digital inputs:
+The core module will support additional sensors via CAN bus, analog inputs, and digital inputs:
 
 | Sensor Type | Connection | Channels | Typical Rate |
 |-------------|-----------|----------|-------------|
@@ -68,7 +68,7 @@ The QMI8658 chip axes are fixed to the PCB. The physical mapping to vehicle axes
 
 ## 2. Communication Layers
 
-The Core Pro uses three communication channels, each optimized for a different purpose:
+The core module uses three communication channels, each optimized for a different purpose:
 
 | Layer | Technology | Bandwidth | Range | Purpose |
 |-------|-----------|-----------|-------|---------|
@@ -134,7 +134,7 @@ These groups have **different data needs** and **must not see each other's detai
                     ▼               ▼                        ▼
                ┌──────────┐   ┌──────────┐           ┌──────────┐
                │  Car 1   │   │  Car 2   │   ...     │  Car 35  │
-               │ Core Pro │   │ Core Pro │           │ Core Pro │
+               │ core module │   │ core module │           │ core module │
                │          │   │          │           │          │
                │ FSK TX   │   │ FSK TX   │           │ FSK TX   │
                │ WiFi AP  │   │ WiFi AP  │           │ WiFi AP  │
@@ -149,7 +149,7 @@ These groups have **different data needs** and **must not see each other's detai
 
 **Data flow:**
 
-1. Each car's Core Pro broadcasts telemetry via FSK radio, encrypted with the event's `race_key`
+1. Each car's core module broadcasts telemetry via FSK radio, encrypted with the event's `race_key`
 2. The Race Control Gateway receives all car packets
 3. Race control dashboard shows position, speed, lap times for all cars
 4. Gateway filters and re-encrypts data for each team with their `team_key`, forwarded over WiFi/Ethernet
@@ -216,7 +216,7 @@ The ESP32-S3 has **hardware AES-128 acceleration**. AES-128 has zero performance
 
 ### The Problem
 
-If a pilot buys their own Core Pro, how does race control trust that the device is sending real data and not spoofed telemetry?
+If a pilot buys their own core module, how does race control trust that the device is sending real data and not spoofed telemetry?
 
 ### Defense Layers
 
@@ -264,11 +264,11 @@ Race control software validates telemetry against physics:
 
 ## 6. Business Scenarios
 
-### Scenario 1: Pilot with own Core Pro
+### Scenario 1: Pilot with own core module
 
-> "I bought a Core Pro. I normally race alone and don't use radio. Now I'm at an organized event and race direction wants to track me."
+> "I bought a core module. I normally race alone and don't use radio. Now I'm at an organized event and race direction wants to track me."
 
-1. Pilot arrives with their Core Pro at check-in
+1. Pilot arrives with their core module at check-in
 2. Race control sends `race_key` to the device (NFC tap or USB)
 3. Device starts FSK radio transmission alongside normal SD + WiFi logging
 4. Race control receives the pilot's position, speed, lap times
