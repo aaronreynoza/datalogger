@@ -1,4 +1,4 @@
-# Core Pro FSK Radio Protocol
+# core module FSK Radio Protocol
 
 **Version:** 1
 **Status:** Draft
@@ -8,7 +8,7 @@
 
 ## Overview
 
-The Core Pro uses the SX1262 radio in **FSK mode** (not LoRa) to transmit telemetry from cars to a Race Control Gateway. FSK provides ~300 kbps throughput — enough for rich telemetry data from 35+ cars at 1 Hz updates.
+The core module uses the SX1262 radio in **FSK mode** (not LoRa) to transmit telemetry from cars to a Race Control Gateway. FSK provides ~300 kbps throughput — enough for rich telemetry data from 35+ cars at 1 Hz updates.
 
 This document specifies the radio packet format, TDMA scheduling, encryption, and multi-team architecture.
 
@@ -298,7 +298,7 @@ The gateway:
 7. Car is cleared to race
 ```
 
-### Check-In Endpoint (on the Core Pro)
+### Check-In Endpoint (on the core module)
 
 ```
 POST /api/v1/radio/configure

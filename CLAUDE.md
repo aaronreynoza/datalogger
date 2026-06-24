@@ -126,7 +126,7 @@ pio device monitor -b 115200          # Serial monitor
 
 ## WiFi Access
 
-- SSID: `tbeam-telemetry` / Password: `tbeam123`
+- SSID: `ApexDirector-{SERIAL}` (e.g., `ApexDirector-CP00001`) / Password: `apex1234`
 - **Auto-disabled during RECORDING/RACING** (SD bus contention)
 - `GET /api/v1/status` — device status JSON
 - `GET /api/v1/tracks` — saved tracks list
@@ -154,4 +154,4 @@ pio device monitor -b 115200          # Serial monitor
 - [ ] CAN data in ATP format (REC_CAN_FRAME = 0x05 records)
 - [ ] CAN vehicle profile management (desktop app → device via WiFi)
 - [ ] GPS PPS-disciplined IMU timestamps
-- [ ] LoRa receiver / pit display
+- [ ] Receiver / pit display (antenna reserved for future use)

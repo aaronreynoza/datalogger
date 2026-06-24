@@ -1,4 +1,4 @@
-# Core Pro WiFi API Specification
+# Core Module WiFi API Specification
 
 **Version:** 1
 **Status:** Draft
@@ -8,7 +8,7 @@
 
 ## Overview
 
-The Core Pro exposes an HTTP + WebSocket API over WiFi for session management, data download, and live telemetry streaming. The API is designed to be consumed by the ApexDirector desktop app but is open — any HTTP client can interact with it.
+The core module exposes an HTTP + WebSocket API over WiFi for session management, data download, and live telemetry streaming. The API is designed to be consumed by the ApexDirector desktop app but is open — any HTTP client can interact with it.
 
 **Design principles:**
 - **JSON for control** — human-readable, debuggable with `curl`, standard tooling
@@ -23,11 +23,11 @@ The Core Pro exposes an HTTP + WebSocket API over WiFi for session management, d
 
 ### mDNS Service Advertisement
 
-The Core Pro advertises itself on the local network using mDNS (Bonjour/Avahi):
+The core module advertises itself on the local network using mDNS (Bonjour/Avahi):
 
 ```
 Service type: _apexdirector._tcp.local
-Service name: CorePro-{SERIAL}._apexdirector._tcp.local
+Service name: CoreModule-{SERIAL}._apexdirector._tcp.local
 Port: 80
 ```
 
@@ -49,8 +49,8 @@ entries := make(chan *zeroconf.ServiceEntry)
 resolver.Browse(ctx, "_apexdirector._tcp", "local.", entries)
 
 for entry := range entries {
-    // entry.HostName = "CorePro-CP00001.local"
-    // entry.AddrIPv4 = [192.168.4.1]
+    // entry.HostName = "CoreModule-CP00001.local"
+    // entry.AddrIPv4 = [10.0.0.1]
     // entry.Port = 80
     // entry.Text = ["version=1", "firmware=1.0.0", ...]
 }
@@ -61,8 +61,8 @@ for entry := range entries {
 **AP Mode (default):**
 - SSID: `ApexDirector-{SERIAL}` (e.g., `ApexDirector-CP00001`)
 - Security: WPA2-PSK
-- Device IP: `192.168.4.1`
-- DHCP: built-in, range `192.168.4.2–192.168.4.14`
+- Device IP: `10.0.0.1`
+- DHCP: built-in, range `10.0.1.2–10.0.1.14`
 
 **Station Mode (configured):**
 - Device joins an existing WiFi network
@@ -457,7 +457,7 @@ When recording starts, read these values from NVS and write them into the `.atp`
 
 ```bash
 # Push config
-curl -X POST http://192.168.4.1/api/v1/config \
+curl -X POST http://10.0.0.1/api/v1/config \
   -H "Content-Type: application/json" \
   -d '{
     "driver_name": "Aaron Valdez",
@@ -471,7 +471,7 @@ curl -X POST http://192.168.4.1/api/v1/config \
   }'
 
 # Read current config
-curl http://192.168.4.1/api/v1/config
+curl http://10.0.0.1/api/v1/config
 ```
 
 ---
@@ -529,18 +529,20 @@ Downloads the raw `.atp` binary file.
 
 **Example with curl:**
 ```bash
-curl -o session.atp http://192.168.4.1/api/v1/sessions/race-20260228-0214/data
+curl -o session.atp http://10.0.0.1/api/v1/sessions/race-20260228-0214/data
 ```
 
 ---
 
-### WS /api/v1/live/stream
+### WS /api/v1/live/stream — Planned, Not Yet Implemented
 
-WebSocket endpoint for real-time telemetry streaming. Sends one ATP chunk per second while the device is recording.
+> **Status:** This WebSocket endpoint is planned but not yet implemented in firmware.
 
-**Connection:**
+WebSocket endpoint for real-time telemetry streaming. Will send one ATP chunk per second while the device is recording.
+
+**Connection (planned):**
 ```javascript
-const ws = new WebSocket('ws://192.168.4.1/api/v1/live/stream')
+const ws = new WebSocket('ws://10.0.0.1/api/v1/live/stream')
 
 ws.onmessage = (event) => {
     // event.data is a binary ATP chunk (same format as in .atp files)
@@ -549,9 +551,9 @@ ws.onmessage = (event) => {
 }
 ```
 
-**Message format:** Each WebSocket message is a single binary ATP chunk (chunk header + records). The format is identical to the chunks in an `.atp` file — the same parser handles both.
+**Message format:** Each WebSocket message will be a single binary ATP chunk (chunk header + records). The format is identical to the chunks in an `.atp` file — the same parser handles both.
 
-**First message:** When a client connects, the server sends a JSON handshake message:
+**First message:** When a client connects, the server will send a JSON handshake message:
 ```json
 {
   "type": "handshake",
@@ -572,7 +574,7 @@ ws.onmessage = (event) => {
 
 ## 4. Comparison with AIM Solo2DL WiFi
 
-| Feature | Core Pro (ATP) | AIM Solo2DL (STCP) |
+| Feature | Core Module (ATP) | AIM Solo2DL (STCP) |
 |---------|---------------|---------------------|
 | **Discovery** | mDNS (automatic) | Hardcoded IP 10.0.0.1 |
 | **Protocol** | HTTP/JSON + WebSocket | Custom binary (STCP/STNC) |
@@ -597,10 +599,10 @@ The desktop app (`reader/core_pro/`) should implement:
 
 ```go
 type CoreProClient struct {
-    baseURL string  // e.g., "http://192.168.4.1"
+    baseURL string  // e.g., "http://10.0.0.1"
 }
 
-// Discover finds Core Pro devices on the network via mDNS
+// Discover finds core module devices on the network via mDNS
 func Discover(ctx context.Context) ([]DeviceInfo, error)
 
 // GetDevice returns device info
