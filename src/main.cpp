@@ -11,6 +11,7 @@
 #include "wifi_server.h"
 #include "track.h"
 #include "race_logger.h"
+#include "can_bus.h"
 
 static constexpr uint32_t PRINT_INTERVAL_MS      = 200;
 static constexpr uint32_t IMU_INTERVAL_MS         = 10;
@@ -88,6 +89,7 @@ static void handleSerialCommands() {
       if (!loggingEnabled) {
         stopRaceLogger();
         stopTrackLog();
+        stopCanLog();
       }
       Serial.print("Logging ");
       Serial.println(loggingEnabled ? "ENABLED" : "DISABLED");
@@ -101,12 +103,25 @@ static void handleSerialCommands() {
       clearLogs();
       resetTrack();
       stopRaceLogger();
+      stopCanLog();
       Serial.println("Logs cleared");
       break;
     case 'l':
     case 'L':
       Serial.println("Log files:");
       listLogsTo(Serial);
+      break;
+    case 'k':
+    case 'K':
+      if (isCanBusReady()) {
+        enableObd2Mode();
+        Serial.println("Switched to OBD2 mode");
+      } else {
+        Serial.println("CAN bus not ready");
+      }
+      break;
+    case 'T':
+      canLoopbackTest();
       break;
   }
 }
@@ -154,6 +169,29 @@ static void printTelemetry() {
     Serial.print("/");
     Serial.print(gpsRecv);
   }
+
+  if (isCanBusReady()) {
+    const CanStats &cs = getCanStats();
+    Serial.print(" | CAN:");
+    Serial.print(cs.mode == CAN_MODE_LISTEN ? "LSN" :
+                 cs.mode == CAN_MODE_OBD2 ? "OBD" : "OFF");
+    Serial.print(" rx=");
+    Serial.print(cs.framesReceived);
+    Serial.print(" ids=");
+    Serial.print(cs.uniqueIds);
+    if (cs.framesDropped > 0) {
+      Serial.print(" drop=");
+      Serial.print(cs.framesDropped);
+    }
+    if (cs.txFailed > 0) {
+      Serial.print(" txF=");
+      Serial.print(cs.txFailed);
+    }
+    if (cs.mode == CAN_MODE_OBD2) {
+      Serial.print(" obd=");
+      Serial.print(cs.obd2Requests);
+    }
+  }
   Serial.println();
 }
 
@@ -169,7 +207,7 @@ void setup() {
 
   Serial.println();
   Serial.println("==== ApexDirector Core Pro ====");
-  Serial.println("Commands: D=toggle log, d=dump, c=clear, l=list");
+  Serial.println("Commands: D=toggle log, d=dump, c=clear, l=list, K=OBD2 mode, T=CAN test");
 
   // PMU must be first — it powers all peripherals
   bool pmuOk = initPmu();
@@ -210,11 +248,16 @@ void setup() {
   initTrack();
   initRaceLogger();
 
+  // CAN bus (TWAI on IO2/IO3 via SN65HVD230 transceiver)
+  bool canOk = initCanBus();
+  displayBootStatus("CAN", canOk);
+
   // Summary to serial so we always see it
   Serial.println("---- Boot summary ----");
   Serial.print("  PMU:  "); Serial.println(pmuOk  ? "OK" : "FAIL");
   Serial.print("  IMU:  "); Serial.println(imuOk  ? "OK" : "FAIL");
   Serial.print("  SD:   "); Serial.println(storageReady ? "OK" : "FAIL");
+  Serial.print("  CAN:  "); Serial.println(canOk ? "OK" : "FAIL");
   Serial.println("----------------------");
 
   // List SD files for debugging
@@ -238,10 +281,11 @@ void setup() {
 
   displayBootDone();
   diagLog("=== BOOT ===");
-  diagLogf("SD=%s IMU=%s LOG=%s",
+  diagLogf("SD=%s IMU=%s LOG=%s CAN=%s",
            storageReady ? "OK" : "FAIL",
            imuOk ? "OK" : "FAIL",
-           loggingEnabled ? "ON" : "OFF");
+           loggingEnabled ? "ON" : "OFF",
+           canOk ? "OK" : "FAIL");
 
   // Non-blocking serial: drop data if USB CDC buffer full (no reader).
   // Must be AFTER all hardware init — setting it earlier breaks SD.begin().
@@ -378,6 +422,36 @@ void loop() {
 
   flushRaceLogger(now);
 
+  // ---- CAN bus processing ----
+  if (isCanBusReady()) {
+    // Auto-start CAN log when GPS epoch is known (captures entire session)
+    static bool canLogStarted = false;
+    if (!canLogStarted && latestGps.epoch > 0 && storageReady && loggingEnabled) {
+      canLogStarted = startCanLog(latestGps.epoch);
+    }
+
+    // Drain ring buffer → raw log file (cap at 100 frames per loop to avoid starving IMU)
+    drainCanToLog(100);
+
+    // Flush CAN log periodically (every 500ms)
+    flushCanLog();
+
+    // Auto-speed detection (500 → 250 kbps fallback)
+    canCheckSpeed(now);
+
+    // OBD2 fallback: if no passive frames after 6s total, switch to active OBD2
+    static bool obd2FallbackDone = false;
+    if (!obd2FallbackDone && now > 6000 && getCanStats().framesReceived == 0 &&
+        getCanMode() == CAN_MODE_LISTEN) {
+      Serial.println("[CAN] No passive frames — switching to OBD2 mode");
+      enableObd2Mode();
+      obd2FallbackDone = true;
+    }
+
+    // Tick OBD2 polling (no-op if not in OBD2 mode)
+    tickObd2(now);
+  }
+
   // Track log flush (every 2s instead of every GPS fix)
   static uint32_t lastTrackFlushMs = 0;
   if (now - lastTrackFlushMs >= TRACK_LOG_FLUSH_MS) {
@@ -409,6 +483,25 @@ void loop() {
     } else if (!needWifiOff && wifiOff) {
       restartWiFi();
       wifiOff = false;
+    }
+
+    // CAN bus detailed diagnostics (every 5s)
+    if (isCanBusReady()) {
+      static uint32_t lastCanDiagMs = 0;
+      if (now - lastCanDiagMs >= 5000) {
+        const CanStats &cs = getCanStats();
+        Serial.printf("[CAN] Stats: rx=%lu ids=%lu err=%lu drop=%lu txFail=%lu obd=%lu mode=%s\n",
+                      (unsigned long)cs.framesReceived,
+                      (unsigned long)cs.uniqueIds,
+                      (unsigned long)cs.busErrors,
+                      (unsigned long)cs.framesDropped,
+                      (unsigned long)cs.txFailed,
+                      (unsigned long)cs.obd2Requests,
+                      cs.mode == CAN_MODE_LISTEN ? "LISTEN" :
+                      cs.mode == CAN_MODE_OBD2 ? "OBD2" : "OFF");
+        printCanTwaiStatus();
+        lastCanDiagMs = now;
+      }
     }
   }
 
